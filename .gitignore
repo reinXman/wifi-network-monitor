@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime data (logs are personal network history — don't commit)
+logs/
+NetworkMonitorLogs/
+netlog_*.csv
+
+# Analysis output
+*_report.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
