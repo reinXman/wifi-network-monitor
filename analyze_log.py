@@ -54,6 +54,7 @@ def load(paths):
                             "dns_server": r.get("dns_server", ""),
                             "signal": int(float(r["signal_pct"])) if r.get("signal_pct") else None,
                             "extra": float(r["extra_ms"]) if r.get("extra_ms") else None,
+                            "load": (r.get("load") or "").strip() == "1",
                         })
                     except (KeyError, ValueError):
                         continue  # tolerate truncated/partial lines
@@ -106,6 +107,17 @@ def report(rows):
     j = jitter(rows)
     if j is not None:
         print(f"Jitter  : avg {j:.1f} ms")
+    loaded = [r for r in rows if r.get("load")]
+    idle = [r for r in rows if not r.get("load")]
+    if loaded:
+        for label, key in (("WAN", "wan"), ("LAN", "lan"), ("DNS", "dns")):
+            li = [r[key] for r in idle if r.get(key) is not None]
+            ll = [r[key] for r in loaded if r.get(key) is not None]
+            if li and ll:
+                print(f"Loaded  : {label} idle avg {statistics.fmean(li):6.1f} ms -> "
+                      f"under load {statistics.fmean(ll):6.1f} ms "
+                      f"(+{statistics.fmean(ll) - statistics.fmean(li):.1f} bufferbloat, "
+                      f"{len(ll)} samples)")
     sigs = [r["signal"] for r in rows if r["signal"] is not None]
     if sigs:
         print(f"Signal  : avg {statistics.fmean(sigs):.0f}%  min {min(sigs)}%")

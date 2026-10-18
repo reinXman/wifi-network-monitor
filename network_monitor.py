@@ -123,6 +123,235 @@ def tcp_probe(ip: str, port: int = 443, timeout: float = 1.5) -> float | None:
         s.close()
 
 
+# ---- Load testing: a mini-iperf in pure stdlib, plus a rude UDP blaster ----
+
+DEFAULT_LOAD_PORT = 5215
+LOAD_MAGIC = "NMLOAD/1"
+MAX_LOAD_SECONDS = 300.0
+_CHUNK = 256 * 1024
+
+
+class _Rate:
+    """Shared token-bucket rate limiter (bytes across all streams). 0 = flat out."""
+
+    def __init__(self, mbps: float):
+        self.rate = mbps * 1e6 / 8.0 if mbps and mbps > 0 else 0.0
+        self.sent = 0
+        self.t0 = None
+        self.lock = threading.Lock()
+
+    def wait(self, n: int):
+        if not self.rate:
+            return
+        with self.lock:
+            if self.t0 is None:
+                self.t0 = time.perf_counter()
+            self.sent += n
+            over = self.sent - self.rate * (time.perf_counter() - self.t0)
+        if over > 0:
+            time.sleep(min(0.1, over / self.rate))
+
+
+def load_server(port: int = DEFAULT_LOAD_PORT) -> None:
+    """Act as the far end of a load test (blocking; Ctrl+C to stop).
+
+    Deploy this on any machine across the path you want to fill: run
+    `python network_monitor.py --serve`, open the port, and point a client
+    at it. Protocol: each connection sends 'NMLOAD/1 <up|down> <seconds>\n'.
+      up   -> server drains bytes until EOF or the deadline
+      down -> server streams a preallocated buffer until the deadline
+    A client opens several connections in parallel to fill the pipe.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))
+    srv.listen(16)
+    print(f"load-test server listening on 0.0.0.0:{port} (Ctrl+C to stop)", flush=True)
+    payload = os.urandom(_CHUNK)
+
+    def handle(conn: socket.socket):
+        try:
+            conn.settimeout(10)
+            buf = b""
+            while b"\n" not in buf and len(buf) < 128:
+                part = conn.recv(64)
+                if not part:
+                    return
+                buf += part
+            parts = buf.split(b"\n", 1)[0].decode("ascii", "ignore").split()
+            if len(parts) != 3 or parts[0] != LOAD_MAGIC:
+                return
+            direction, seconds = parts[1], float(parts[2])
+            if direction not in ("up", "down") or not 0 < seconds <= MAX_LOAD_SECONDS:
+                return
+            conn.settimeout(30)
+            if direction == "up":
+                deadline = time.monotonic() + seconds + 2.0  # grace for in-flight data
+                while time.monotonic() < deadline:
+                    if not conn.recv(_CHUNK):
+                        return
+            else:
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    conn.sendall(payload)
+        except OSError:
+            pass  # client hung up / deadline hit — that's the normal exit
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    try:
+        while True:
+            conn, _addr = srv.accept()
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+    finally:
+        srv.close()
+
+
+def tcp_load_client(host: str, port: int = DEFAULT_LOAD_PORT, seconds: float = 15.0,
+                    streams: int = 4, direction: str = "both", mbps: float = 0.0) -> dict:
+    """Fill the path to `host` with `streams` parallel TCP streams.
+
+    Requires a peer running --serve across the path being tested. Returns
+    achieved Mbps per direction, e.g. {"down": 94.2, "up": 11.5} (None = failed).
+    """
+    results: dict = {}
+
+    def stream(d: str):
+        rate = _Rate(mbps)
+        payload = os.urandom(_CHUNK)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sent = 0
+        try:
+            s.settimeout(30)
+            s.connect((host, port))
+            s.sendall(f"{LOAD_MAGIC} {d} {seconds}\n".encode())
+            if d == "up":
+                end = time.monotonic() + seconds
+                while time.monotonic() < end:
+                    s.sendall(payload)
+                    sent += len(payload)
+                    rate.wait(len(payload))
+            else:
+                end = time.monotonic() + seconds
+                s.settimeout(2.0)
+                while time.monotonic() < end:
+                    try:
+                        got = s.recv(_CHUNK)
+                    except socket.timeout:
+                        continue
+                    if not got:
+                        break
+                    sent += len(got)
+            results[d] = sent * 8.0 / 1e6 / seconds
+        except OSError as e:
+            results[d] = None
+            results["error"] = str(e)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def wave(d: str):
+        threads = [threading.Thread(target=stream, args=(d,), daemon=True)
+                   for _ in range(max(1, streams))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    if direction in ("down", "both"):
+        wave("down")
+    if direction in ("up", "both"):
+        wave("up")
+    return results
+
+
+def udp_blast(host: str, port: int = 9, seconds: float = 10.0, mbps: float = 20.0,
+              size: int = 1400) -> float | None:
+    """"Rude" load: fire-and-forget UDP blast. No peer cooperation needed.
+
+    The point is to fill the *outbound* path with junk — useful when you can't
+    deploy a peer, or want to stress the link itself. Etiquette and sanity:
+      * point it at a discarded/filtered port (9=discard, or a firewalled port)
+        so the target doesn't answer with ICMP unreachable storms
+      * keep the rate cap honest — this is a troubleshooting tool, not a weapon
+    Returns achieved Mbps, or None on a network error.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rate = _Rate(mbps)
+    payload = os.urandom(max(1, min(size, 65507)))
+    sent, t0 = 0, time.perf_counter()
+    try:
+        while time.perf_counter() - t0 < seconds:
+            s.sendto(payload, (host, port))
+            sent += len(payload)
+            rate.wait(len(payload))
+        return sent * 8.0 / 1e6 / seconds
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def bufferbloat(series: list, t0: float, t1: float, idle: float = 30.0):
+    """Mean latency before vs during [t0, t1]. Returns (idle_mean|None, load_mean)."""
+    pre = [s.v for s in series if s.v is not None and t0 - idle <= s.t < t0]
+    load = [s.v for s in series if s.v is not None and t0 <= s.t <= t1]
+    if not load:
+        return None
+    return (statistics.fmean(pre) if pre else None, statistics.fmean(load))
+
+
+def cli_load_test(host: str, *, seconds: float, streams: int, direction: str,
+                  mbps: float, rude: bool, rude_port: int) -> None:
+    """Headless load test: also pings the target 1x/s and reports bufferbloat."""
+    ip = resolve_host(host)
+    if not ip:
+        print(f"cannot resolve {host}")
+        return
+    samples: list[tuple[float, float | None]] = []
+    stop = threading.Event()
+
+    def sampler():
+        while not stop.is_set():
+            samples.append((time.time(), icmp_ping(ip, timeout_ms=1000)))
+            stop.wait(1.0)
+
+    threading.Thread(target=sampler, daemon=True).start()
+    print(f"target {ip} - 5 s idle baseline...")
+    time.sleep(5.0)
+    t0 = time.time()
+    if rude:
+        got = udp_blast(ip, rude_port, seconds, mbps or 20.0)
+        print(f"UDP blast: {got:.1f} Mbps sent" if got else "UDP blast failed (network error)")
+    else:
+        res = tcp_load_client(ip, seconds=seconds, streams=streams,
+                              direction=direction, mbps=mbps)
+        for d, label in (("down", "Download"), ("up", "Upload")):
+            if res.get(d) is not None:
+                print(f"{label:9}: {res[d]:8.1f} Mbps")
+            else:
+                extra = f" ({res['error']})" if res.get("error") else ""
+                print(f"{label:9}: failed{extra}")
+    t1 = time.time()
+    time.sleep(2.0)  # let the queue drain before the last samples
+    stop.set()
+    pre = [v for t, v in samples if v is not None and t < t0]
+    load = [v for t, v in samples if v is not None and t0 <= t <= t1]
+    if pre and load:
+        pi, li = statistics.fmean(pre), statistics.fmean(load)
+        print(f"latency idle->loaded: {pi:.1f} -> {li:.1f} ms  "
+              f"(bufferbloat +{li - pi:.1f} ms)")
+    elif load:
+        print(f"latency under load: {statistics.fmean(load):.1f} ms (no idle baseline)")
+    else:
+        print("no successful pings — target unreachable or fully saturated")
+
+
 # ---- Raw UDP DNS probe (same wire-craft as our DNS benchmark) --------------
 
 def _build_query(name: str) -> tuple[int, bytes]:
@@ -367,6 +596,8 @@ class State:
         self.dns = deque(maxlen=window)
         self.signal = deque(maxlen=window)
         self.events = deque(maxlen=100)
+        self.load_spans = deque(maxlen=50)  # [t0, t1|None, label] load-test windows
+        self.load_active = False
         self.wifi = None
         self.gateway = None
         self.wan_host = None
@@ -605,7 +836,7 @@ class Collector(threading.Thread):
             csv.writer(f).writerow(["time_iso", "epoch", "gateway",
                                     "lan_ms", "wan_ms", "dns_ms",
                                     "dns_server", "signal_pct",
-                                    "extra_ms", "extra_target"])
+                                    "extra_ms", "extra_target", "load"])
             f.flush()
             self.log_file = f
             self.log_path = path
@@ -633,12 +864,15 @@ class Collector(threading.Thread):
             return
         try:
             st = self.state
+            with st.lock:
+                load_active = st.load_active
             csv.writer(self.log_file).writerow([
                 time.strftime("%Y-%m-%d %H:%M:%S"), f"{time.time():.3f}",
                 st.gateway or "", self._fmt(lan_rtt), self._fmt(wan_rtt),
                 self._fmt(self._last_dns),
                 st.dns_server or "", self._fmt(self._last_signal),
                 self._fmt(extra_rtt), st.extra_host or "",
+                "1" if load_active else "",
             ])
             self.log_file.flush()
         except Exception:
@@ -701,8 +935,9 @@ class GraphWidget(tk.Canvas):
         self.bind("<Motion>", self._on_motion)
         self.bind("<Leave>", lambda e: self._clear_hover())
 
-    def set_data(self, data: list[Sample]):
+    def set_data(self, data: list[Sample], spans: list | None = None):
         self.data = data[-self.max_points:]
+        self.spans = spans or []
         self.redraw()
 
     # ---- drawing ----
@@ -766,6 +1001,17 @@ class GraphWidget(tk.Canvas):
         self._px = px
 
         fill_color = blend(self.color, BG, 0.82)
+
+        # load-test windows: shaded bands so latency-under-load is visible
+        for t0, t1, label in getattr(self, "spans", []):
+            idx = [i for i, s in enumerate(self.data)
+                   if s.t >= t0 and (t1 is None or s.t <= t1)]
+            if len(idx) >= 2:
+                x0, x1 = px(idx[0]), px(idx[-1])
+                self.create_rectangle(x0, pad_t, x1, self._plot[3],
+                                      fill=blend(BLUE, BG, 0.86), outline="")
+                self.create_text(x0 + 4, pad_t + 8, anchor="w", text=label or "LOAD",
+                                 fill=blend(BLUE, TEXT, 0.55), font=f.get("tiny"))
 
         # contiguous segments (gaps where v is None)
         seg, segments = [], []
@@ -1013,6 +1259,9 @@ class Dashboard(tk.Tk):
                                    fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
                                    relief="flat", font=self.fonts["small"], padx=12)
         self.pause_btn.pack(side="right", padx=4)
+        tk.Button(bar, text="Load test", command=self._open_load_dialog, bg=CARD,
+                  fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
+                  relief="flat", font=self.fonts["small"], padx=12).pack(side="right")
         tk.Button(bar, text="Reset stats", command=self._reset_stats, bg=CARD, fg=TEXT,
                   activebackground=BORDER, activeforeground=TEXT, relief="flat",
                   font=self.fonts["small"], padx=12).pack(side="right")
@@ -1056,9 +1305,152 @@ class Dashboard(tk.Tk):
 
     def _reset_stats(self):
         with self.state.lock:
-            self.state.counts = {"wan_sent": 0, "wan_recv": 0, "lan_sent": 0, "lan_recv": 0}
+            self.state.counts = {"wan_sent": 0, "wan_recv": 0, "lan_sent": 0,
+                                 "lan_recv": 0, "extra_sent": 0, "extra_recv": 0}
             self.state.start_time = time.time()
         self.state.add_event("Statistics reset")
+
+    # ---- load test ----
+
+    def _open_load_dialog(self):
+        f = self.fonts
+        dlg = tk.Toplevel(self)
+        dlg.title("Load test")
+        dlg.configure(bg=PANEL, padx=14, pady=10)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        mode = tk.StringVar(value="tcp")
+        target = tk.StringVar(value="wan")
+        direction = tk.StringVar(value="both")
+        seconds = tk.StringVar(value="15")
+        streams = tk.StringVar(value="4")
+        mbps = tk.StringVar(value="0")
+        udp_host = tk.StringVar(value="")
+        udp_port = tk.StringVar(value="9")
+
+        def lab(parent, text):
+            tk.Label(parent, text=text, bg=PANEL, fg=MUTED,
+                     font=f["small"]).pack(side="left")
+
+        def ent(parent, var, w=8):
+            tk.Entry(parent, textvariable=var, bg=CARD, fg=TEXT, insertbackground=TEXT,
+                     relief="flat", font=f["sub"], width=w).pack(side="left", padx=6)
+
+        def radio(parent, var, val, text):
+            tk.Radiobutton(parent, text=text, variable=var, value=val, bg=PANEL, fg=TEXT,
+                           selectcolor=CARD, activebackground=PANEL, font=f["small"],
+                           activeforeground=TEXT, relief="flat").pack(side="left")
+
+        r1 = tk.Frame(dlg, bg=PANEL); r1.pack(anchor="w", pady=2)
+        lab(r1, "MODE   ")
+        radio(r1, mode, "tcp", "TCP peer (mini-iperf)    ")
+        radio(r1, mode, "udp", "Rude UDP blast")
+        r2 = tk.Frame(dlg, bg=PANEL); r2.pack(anchor="w", pady=2)
+        lab(r2, "TARGET   ")
+        radio(r2, target, "gateway", "Gateway    ")
+        radio(r2, target, "wan", "WAN    ")
+        radio(r2, target, "custom", "Custom")
+        r3 = tk.Frame(dlg, bg=PANEL); r3.pack(anchor="w", pady=2)
+        lab(r3, "UDP TARGET   ")
+        ent(r3, udp_host, 16)
+        lab(r3, "  port ")
+        ent(r3, udp_port, 6)
+        r4 = tk.Frame(dlg, bg=PANEL); r4.pack(anchor="w", pady=2)
+        lab(r4, "DIRECTION   ")
+        radio(r4, direction, "down", "Download    ")
+        radio(r4, direction, "up", "Upload    ")
+        radio(r4, direction, "both", "Both")
+        r5 = tk.Frame(dlg, bg=PANEL); r5.pack(anchor="w", pady=2)
+        lab(r5, "SECONDS ")
+        ent(r5, seconds)
+        lab(r5, "   STREAMS ")
+        ent(r5, streams)
+        lab(r5, "   RATE CAP Mbps (0 = flat out) ")
+        ent(r5, mbps, 10)
+
+        btns = tk.Frame(dlg, bg=PANEL)
+        btns.pack(anchor="e", pady=(10, 0))
+
+        def run():
+            try:
+                params = {
+                    "mode": mode.get(), "target": target.get(), "dir": direction.get(),
+                    "seconds": min(MAX_LOAD_SECONDS, max(1.0, float(seconds.get()))),
+                    "streams": max(1, min(64, int(streams.get()))),
+                    "mbps": max(0.0, float(mbps.get())),
+                    "udp_host": udp_host.get().strip(),
+                    "udp_port": max(1, min(65535, int(udp_port.get()))),
+                }
+            except ValueError:
+                self.state.add_event("Load test: invalid parameters", "warn")
+                return
+            dlg.destroy()
+            threading.Thread(target=self._run_load_test, args=(params,),
+                             daemon=True).start()
+
+        tk.Button(btns, text="Run", command=run, bg=CARD, fg=GREEN,
+                  activebackground=BORDER, activeforeground=TEXT, relief="flat",
+                  font=f["small"], padx=14).pack(side="left", padx=4)
+        tk.Button(btns, text="Cancel", command=dlg.destroy, bg=CARD, fg=TEXT,
+                  activebackground=BORDER, activeforeground=TEXT, relief="flat",
+                  font=f["small"], padx=14).pack(side="left")
+
+    def _run_load_test(self, p: dict):
+        st = self.state
+        col = self.collector
+        if p["mode"] == "udp":
+            if not p["udp_host"]:
+                st.add_event("Load test: UDP target host required", "warn")
+                return
+            host, label = p["udp_host"], f"UDP {p['udp_host']}:{p['udp_port']}"
+        else:
+            if p["target"] == "gateway":
+                host, label = st.gateway, "gateway"
+            elif p["target"] == "wan":
+                host, label = col._wan_ip or col.wan_host, f"WAN {col.wan_host}"
+            elif col.extra_host:
+                host, label = col.extra_host, f"custom {col.extra_host}"
+            else:
+                host, label = None, None
+            if not host:
+                st.add_event("Load test: target unavailable (set it in the top bar)", "warn")
+                return
+        t0 = time.time()
+        with st.lock:
+            st.load_active = True
+            st.load_spans.append([t0, None, "LOAD"])
+        st.add_event(f"Load test started — {label}, {p['seconds']:.0f}s", "warn")
+        try:
+            if p["mode"] == "udp":
+                got = udp_blast(host, p["udp_port"], p["seconds"], p["mbps"] or 20.0)
+                res_txt = f"rude UDP → {label}: {got:.0f} Mbps" if got else "rude UDP failed"
+            else:
+                res = tcp_load_client(host, seconds=p["seconds"], streams=p["streams"],
+                                      direction=p["dir"], mbps=p["mbps"])
+                parts = [f"{d} {res[d]:.0f} Mbps" for d in ("down", "up")
+                         if res.get(d) is not None]
+                res_txt = (f"TCP peer {label}: " + ", ".join(parts)) if parts \
+                    else "TCP peer: no data"
+        finally:
+            t1 = time.time()
+            with st.lock:
+                st.load_active = False
+                for sp in st.load_spans:
+                    if sp[1] is None:
+                        sp[1] = t1
+        st.add_event(res_txt, "good")
+        # bufferbloat: idle-vs-loaded mean latency on every probe path
+        with st.lock:
+            rows = []
+            for name, deq in (("LAN", st.lan), ("WAN", st.wan), ("DNS", st.dns),
+                              ("CUSTOM", st.extra)):
+                bb = bufferbloat(list(deq), t0, t1)
+                if bb and bb[1] is not None:
+                    rows.append(f"{name} {bb[0]:.0f}→{bb[1]:.0f} ms" if bb[0] is not None
+                                else f"{name} →{bb[1]:.0f} ms (no idle baseline)")
+        if rows:
+            st.add_event("Latency under load (idle→loaded): " + "  ·  ".join(rows), "warn")
 
     # ---- refresh loop ----
 
@@ -1075,6 +1467,7 @@ class Dashboard(tk.Tk):
         with st.lock:
             lan, wan, dns, sig, extra = (list(st.lan), list(st.wan), list(st.dns),
                                          list(st.signal), list(st.extra))
+            spans = list(st.load_spans)
             counts = dict(st.counts)
             wifi, wifi_avail = st.wifi, st.wifi_available
             events = list(st.events)
@@ -1162,10 +1555,10 @@ class Dashboard(tk.Tk):
 
         # --- graphs ---
         window = st.window
-        self.g_wan.set_data(wan[-window:])
-        self.g_lan.set_data(lan[-window:])
-        self.g_dns.set_data(dns[-window:])
-        self.g_extra.set_data(extra[-window:])
+        self.g_wan.set_data(wan[-window:], spans)
+        self.g_lan.set_data(lan[-window:], spans)
+        self.g_dns.set_data(dns[-window:], spans)
+        self.g_extra.set_data(extra[-window:], spans)
         # jitter series: |Δ| between consecutive present samples
         js = []
         prev_t = prev_v = None
@@ -1179,7 +1572,7 @@ class Dashboard(tk.Tk):
             else:
                 js.append(Sample(s.t, None))
                 prev_t, prev_v = s.t, s.v
-        self.g_jitter.set_data(js[-window:])
+        self.g_jitter.set_data(js[-window:], spans)
         self.g_signal.set_data(sig[-window:])
 
         # --- event log ---
@@ -1231,7 +1624,35 @@ def main():
                     help="DNS probe server ('auto' = use system DNS)")
     ap.add_argument("--dns-name", default="www.google.com", help="DNS probe name")
     ap.add_argument("--no-gui", action="store_true", help="headless diagnostic mode")
+    ap.add_argument("--serve", action="store_true",
+                    help="act as a load-test peer (mini-iperf server); Ctrl+C to stop")
+    ap.add_argument("--port", type=int, default=DEFAULT_LOAD_PORT,
+                    help="load-test server port (default 5215)")
+    ap.add_argument("--load-test", metavar="HOST",
+                    help="run a load test against HOST (needs a --serve peer, "
+                         "or --rude) then exit")
+    ap.add_argument("--load-dir", choices=("down", "up", "both"), default="both",
+                    help="load test direction (default both)")
+    ap.add_argument("--load-seconds", type=float, default=15.0,
+                    help="load test duration (default 15)")
+    ap.add_argument("--load-streams", type=int, default=4,
+                    help="parallel streams (default 4)")
+    ap.add_argument("--load-mbps", type=float, default=0.0,
+                    help="rate cap in Mbps (0 = flat out)")
+    ap.add_argument("--rude", action="store_true",
+                    help="with --load-test: rude UDP blast (no peer needed)")
+    ap.add_argument("--rude-port", type=int, default=9,
+                    help="rude mode target port (default 9 = discard)")
     args = ap.parse_args()
+
+    if args.serve:
+        load_server(args.port)
+        return
+    if args.load_test:
+        cli_load_test(args.load_test, seconds=args.load_seconds,
+                      streams=args.load_streams, direction=args.load_dir,
+                      mbps=args.load_mbps, rude=args.rude, rude_port=args.rude_port)
+        return
 
     state = State(args.window)
     collector = Collector(state, args.interval, args.wan, args.dns_server,

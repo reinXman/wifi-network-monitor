@@ -27,6 +27,10 @@ The point of the LAN/WAN split is telling you *where* a problem is:
 - **Packet loss** — failed WAN probes, per session
 - **DNS latency** — a real A-record query over raw UDP to your system DNS
   (or a server of your choice — set it in the top bar or with `--dns-server`)
+- **Load testing** — fill any path on demand: a built-in mini-iperf
+  (`--serve` peer + TCP streams) and a rate-capped rude UDP mode for
+  peer-less tests. Latency-under-load (bufferbloat) is measured and shaded
+  on the graphs automatically. See **[LOAD_TEST_GUIDE.md](LOAD_TEST_GUIDE.md)**.
 - **WiFi signal** — SSID, %, band, link rate. Windows 11 wants the app
   elevated (or Location permission) for this; `run_admin.bat` handles that.
   On Linux this panel is empty.
