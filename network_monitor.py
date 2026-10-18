@@ -46,6 +46,10 @@ from collections import deque, namedtuple
 # ---------------------------------------------------------------------------
 
 IS_WINDOWS = sys.platform == "win32"
+# Prevent console windows when running under pythonw (windowless launcher):
+# console subprocesses (route, netsh, …) would otherwise flash a new cmd window
+# on every call. 0 is a no-op on POSIX and inside console sessions.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # ---- ICMP via iphlpapi (no ping.exe parsing, locale-independent) -----------
 
@@ -169,7 +173,8 @@ def get_dns_servers() -> list[str]:
     """Return configured DNS server IPs (IPv4), best-effort."""
     if not IS_WINDOWS:
         try:
-            out = subprocess.run(["resolvectl", "status"], capture_output=True, text=True).stdout
+            out = subprocess.run(["resolvectl", "status"], capture_output=True, text=True,
+                                 creationflags=NO_WINDOW).stdout
             return list(dict.fromkeys(re.findall(r"DNS Servers?: (\d+\.\d+\.\d+\.\d+)", out)))
         except Exception:
             return []
@@ -197,14 +202,15 @@ def get_default_gateway() -> str | None:
     if not IS_WINDOWS:
         try:
             out = subprocess.run(["ip", "route", "show", "default"],
-                                 capture_output=True, text=True).stdout
+                                 capture_output=True, text=True, creationflags=NO_WINDOW).stdout
             m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
             return m.group(1) if m else None
         except Exception:
             return None
     try:
         out = subprocess.run(["route", "print", "-4", "0.0.0.0"],
-                             capture_output=True, text=True, timeout=10).stdout
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=NO_WINDOW).stdout
         rows = re.findall(
             r"^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\S+)\s+(\S+)\s+(\d+)\s*$", out, re.M)
         best_ip, best_metric = None, None
@@ -310,7 +316,8 @@ def query_wifi() -> dict | None:
         return native
     try:
         out = subprocess.run(["netsh", "wlan", "show", "interfaces"],
-                             capture_output=True, text=True, timeout=8).stdout
+                             capture_output=True, text=True, timeout=8,
+                             creationflags=NO_WINDOW).stdout
     except Exception:
         return None
     low = out.lower()
