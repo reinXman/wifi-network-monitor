@@ -1369,6 +1369,12 @@ class Dashboard(tk.Tk):
         lab(r5, "   RATE CAP Mbps (0 = flat out) ")
         ent(r5, mbps, 10)
 
+        # center the dialog on the app window (needs final size first)
+        dlg.update_idletasks()
+        dw, dh = dlg.winfo_width(), dlg.winfo_height()
+        dlg.geometry(f"+{self.winfo_x() + (self.winfo_width() - dw) // 2}"
+                     f"+{self.winfo_y() + (self.winfo_height() - dh) // 2}")
+
         btns = tk.Frame(dlg, bg=PANEL)
         btns.pack(anchor="e", pady=(10, 0))
 
