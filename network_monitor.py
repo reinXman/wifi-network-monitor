@@ -95,10 +95,34 @@ def icmp_ping(ip_str: str, timeout_ms: int = 1500, payload: bytes = b"network-mo
         _icmp.IcmpCloseHandle(ctypes.c_void_p(h))
 
 
+def resolve_host(host: str) -> str | None:
+    """Return an IPv4 address for a target (IP passthrough or DNS lookup)."""
+    if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host or ""):
+        return host
+    try:
+        return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    except Exception:
+        return None
+
+
+def tcp_probe(ip: str, port: int = 443, timeout: float = 1.5) -> float | None:
+    """TCP connect RTT in ms, or None. Cross-check for ICMP-blocked paths."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        t0 = time.perf_counter()
+        s.connect((ip, port))
+        return (time.perf_counter() - t0) * 1000.0
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
 # ---- Raw UDP DNS probe (same wire-craft as our DNS benchmark) --------------
 
 def _build_query(name: str) -> tuple[int, bytes]:
-    qid = int.from_bytes(socket.os.urandom(2), "big")
+    qid = int.from_bytes(os.urandom(2), "big")
     header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
     qname = b"".join(bytes([len(l)]) + l.encode("ascii") for l in name.split(".") if l) + b"\x00"
     return qid, header + qname + struct.pack(">HH", 1, 1)
@@ -107,18 +131,24 @@ def _build_query(name: str) -> tuple[int, bytes]:
 def dns_probe(server: str = "1.1.1.1", name: str = "www.google.com", timeout: float = 2.0) -> float | None:
     """Time a real A-record query over UDP. Returns RTT in ms or None."""
     qid, pkt = _build_query(name)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(timeout)
         t0 = time.perf_counter()
         s.sendto(pkt, (server, 53))
         data, _ = s.recvfrom(1024)
-        s.close()
         if len(data) < 12 or data[:2] != struct.pack(">H", qid):
+            return None
+        flags = (data[2] << 8) | data[3]
+        if not flags & 0x8000:  # QR bit: not a response
+            return None
+        if flags & 0x000F:      # RCODE != NOERROR
             return None
         return (time.perf_counter() - t0) * 1000.0
     except Exception:
         return None
+    finally:
+        s.close()
 
 
 # ---- System DNS servers via GetNetworkParams (locale-free, no admin) -------
@@ -326,16 +356,20 @@ class State:
         self.window = window
         self.lan = deque(maxlen=window)
         self.wan = deque(maxlen=window)
+        self.extra = deque(maxlen=window)
         self.dns = deque(maxlen=window)
         self.signal = deque(maxlen=window)
         self.events = deque(maxlen=100)
         self.wifi = None
         self.gateway = None
+        self.wan_host = None
+        self.extra_host = None
         self.wifi_available = None  # None = unknown, False = unavailable
         self.dns_server = None
         self.start_time = time.time()
-        self.counts = {"wan_sent": 0, "wan_recv": 0, "lan_sent": 0, "lan_recv": 0}
-        self._lan_ok = self._wan_ok = None
+        self.counts = {"wan_sent": 0, "wan_recv": 0, "lan_sent": 0, "lan_recv": 0,
+                       "extra_sent": 0, "extra_recv": 0}
+        self._lan_ok = self._wan_ok = self._extra_ok = None
         self._signal_warned = False
 
     def add_event(self, msg: str, kind: str = "info"):
@@ -345,32 +379,44 @@ class State:
         with self.lock:
             deq.append(Sample(time.time(), v))
 
-    def check_transitions(self, lan_ok: bool, wan_ok: bool):
+    def check_transitions(self, lan_ok: bool, wan_ok: bool,
+                          extra_ok: bool | None = None,
+                          extra_label: str | None = None):
         if self._lan_ok is not None:
             if self._lan_ok and not lan_ok:
                 self.add_event("Connection to router LOST", "bad")
             elif not self._lan_ok and lan_ok:
                 self.add_event("Router connection restored", "good")
-            if self._wan_ok and not wan_ok:
+            # if the whole link dropped, the LAN-lost event already covers it
+            if self._wan_ok and not wan_ok and lan_ok:
                 self.add_event("Internet connectivity LOST", "bad")
-            elif not self._wan_ok and wan_ok and not self._lan_ok:
-                pass
-            elif not self._wan_ok and wan_ok:
+            elif not self._wan_ok and wan_ok and self._lan_ok:
                 self.add_event("Internet connectivity restored", "good")
+        if extra_ok is not None and self._extra_ok is not None and extra_label:
+            if self._extra_ok and not extra_ok:
+                self.add_event(f"Custom target {extra_label} LOST", "bad")
+            elif not self._extra_ok and extra_ok:
+                self.add_event(f"Custom target {extra_label} restored", "good")
         self._lan_ok, self._wan_ok = lan_ok, wan_ok
+        self._extra_ok = extra_ok if extra_ok is not None else self._extra_ok
 
 
 class Collector(threading.Thread):
-    def __init__(self, state: State, interval: float, wan_host: str, dns_server: str, dns_name: str):
+    def __init__(self, state: State, interval: float, wan_host: str, dns_server: str,
+                 dns_name: str, extra_host: str | None = None):
         super().__init__(daemon=True)
         self.state = state
         self.interval = interval
         self.wan_host = wan_host
+        self.extra_host = extra_host
         self.dns_server = dns_server
         self.dns_name = dns_name
         self.stop_flag = threading.Event()
         self._tick = 0
         self._began = False
+        self._wan_ip = None    # resolved IPv4 for the WAN target
+        self._extra_ip = None  # resolved IPv4 for the custom target
+        self._last_tcp_check = 0.0
         # CSV logging
         self.log_flag = threading.Event()
         self.log_file = None
@@ -378,10 +424,68 @@ class Collector(threading.Thread):
         self._last_dns = None
         self._last_signal = None
 
+    def _resolve_targets(self, st: State) -> None:
+        """Resolve hostname targets to IPs (no-op for IP literals)."""
+        ip = resolve_host(self.wan_host)
+        if ip:
+            self._wan_ip = ip
+        if self.extra_host:
+            ip = resolve_host(self.extra_host)
+            if ip:
+                self._extra_ip = ip
+        else:
+            self._extra_ip = None
+
+    def set_targets(self, wan_host: str, extra_host: str | None) -> bool:
+        """Live-update probe targets (thread-safe; called from the GUI)."""
+        wan_host = (wan_host or "").strip()
+        if not wan_host:
+            return False
+        st = self.state
+        self.wan_host = wan_host
+        self._wan_ip = None
+        if extra_host != self.extra_host:
+            self.extra_host = extra_host
+            self._extra_ip = None
+            with st.lock:
+                st.extra.clear()
+        st.wan_host = wan_host
+        st.extra_host = extra_host
+        self._resolve_targets(st)
+        msg = f"Targets set — WAN {wan_host} ({self._wan_ip or 'unresolved'})"
+        if extra_host:
+            msg += f"; custom {extra_host} ({self._extra_ip or 'unresolved'})"
+        st.add_event(msg, "info")
+        return True
+
+    def set_dns(self, server: str) -> bool:
+        """Live-update the DNS probe target ('auto' = re-detect system DNS)."""
+        server = (server or "").strip() or "auto"
+        st = self.state
+        self.dns_server = server
+        if server == "auto":
+            st.dns_server = None
+            servers = get_dns_servers()
+            if servers:
+                st.dns_server = servers[0]
+            st.add_event(f"DNS probe target: {st.dns_server or '1.1.1.1 (fallback)'} (system)",
+                         "info")
+        else:
+            st.dns_server = server
+            ip = resolve_host(server)
+            if ip:
+                st.add_event(f"DNS probe target: {server}" + (f" ({ip})" if ip != server else ""),
+                             "info")
+            else:
+                st.add_event(f"DNS probe target: {server} — not resolvable yet", "warn")
+        return True
+
     def run(self):
         st = self.state
         if not self._began:
             self._began = True
+            st.wan_host = self.wan_host
+            st.extra_host = self.extra_host
             st.gateway = get_default_gateway()
             if st.gateway:
                 st.add_event(f"Monitoring started — gateway {st.gateway}, WAN host {self.wan_host}")
@@ -402,17 +506,38 @@ class Collector(threading.Thread):
                     if servers and servers[0] != st.dns_server:
                         st.dns_server = servers[0]
                         st.add_event(f"DNS probe target: {st.dns_server} (system)", "info")
+                self._resolve_targets(st)  # pick up DNS changes for hostname targets
+
+            if self._wan_ip is None:
+                self._resolve_targets(st)
 
             lan_rtt = icmp_ping(st.gateway) if st.gateway else None
-            wan_rtt = icmp_ping(self.wan_host)
+            wan_rtt = icmp_ping(self._wan_ip) if self._wan_ip else None
+            extra_rtt = icmp_ping(self._extra_ip) if self._extra_ip else None
             with st.lock:
                 st.counts["lan_sent"] += 1
                 st.counts["wan_sent"] += 1
                 st.counts["lan_recv"] += lan_rtt is not None
                 st.counts["wan_recv"] += wan_rtt is not None
+                if self.extra_host:
+                    st.counts["extra_sent"] += 1
+                    st.counts["extra_recv"] += extra_rtt is not None
             st.record(st.lan, lan_rtt)
             st.record(st.wan, wan_rtt)
-            st.check_transitions(lan_rtt is not None, wan_rtt is not None)
+            if self.extra_host:
+                st.record(st.extra, extra_rtt)
+            st.check_transitions(lan_rtt is not None, wan_rtt is not None,
+                                 extra_rtt is not None if self.extra_host else None,
+                                 self.extra_host)
+
+            # cross-check: when ICMP to WAN fails but LAN is fine, try TCP:443
+            # (rate-limited) so ICMP-blocking networks don't read as fully down
+            if wan_rtt is None and lan_rtt is not None and self._wan_ip \
+                    and time.time() - self._last_tcp_check > 60:
+                self._last_tcp_check = time.time()
+                if tcp_probe(self._wan_ip):
+                    st.add_event(f"{self.wan_host}: ICMP failed but TCP:443 reachable "
+                                 "— ICMP may be blocked/deprioritized", "warn")
 
             # DNS probe (every tick — a blank in the CSV then means a real failure)
             server = st.dns_server if (self.dns_server == "auto" and st.dns_server) \
@@ -425,8 +550,12 @@ class Collector(threading.Thread):
                 st.wifi = w
                 if w is None and st.wifi_available is not False:
                     st.wifi_available = False
-                    st.add_event("WiFi details unavailable — restart as Administrator "
-                                 "to enable signal/SSID (use run_admin.bat)", "warn")
+                    if IS_WINDOWS:
+                        st.add_event("WiFi details unavailable — restart as Administrator "
+                                     "to enable signal/SSID (use run_admin.bat)", "warn")
+                    else:
+                        st.add_event("WiFi details unavailable — not supported on this "
+                                     "platform", "warn")
                 if w and "signal" in w:
                     sig = w["signal"]
                     self._last_signal = sig
@@ -438,7 +567,7 @@ class Collector(threading.Thread):
                         st._signal_warned = False
 
             self._tick += 1
-            self._log_row(lan_rtt, wan_rtt)
+            self._log_row(lan_rtt, wan_rtt, extra_rtt)
             elapsed = time.perf_counter() - t0
             self.stop_flag.wait(max(0.05, self.interval - elapsed))
 
@@ -468,7 +597,8 @@ class Collector(threading.Thread):
             f = open(path, "a", newline="", encoding="utf-8")
             csv.writer(f).writerow(["time_iso", "epoch", "gateway",
                                     "lan_ms", "wan_ms", "dns_ms",
-                                    "dns_server", "signal_pct"])
+                                    "dns_server", "signal_pct",
+                                    "extra_ms", "extra_target"])
             f.flush()
             self.log_file = f
             self.log_path = path
@@ -491,7 +621,7 @@ class Collector(threading.Thread):
     def _fmt(v) -> str:
         return "" if v is None else f"{v:.1f}"
 
-    def _log_row(self, lan_rtt, wan_rtt):
+    def _log_row(self, lan_rtt, wan_rtt, extra_rtt=None):
         if not self.log_flag.is_set() or self.log_file is None:
             return
         try:
@@ -501,6 +631,7 @@ class Collector(threading.Thread):
                 st.gateway or "", self._fmt(lan_rtt), self._fmt(wan_rtt),
                 self._fmt(self._last_dns),
                 st.dns_server or "", self._fmt(self._last_signal),
+                self._fmt(extra_rtt), st.extra_host or "",
             ])
             self.log_file.flush()
         except Exception:
@@ -523,6 +654,7 @@ YELLOW  = "#fbbf24"
 BLUE    = "#60a5fa"
 CYAN    = "#22d3ee"
 PURPLE  = "#c084fc"
+ROSE    = "#fb7185"
 
 STATUS_STYLES = {
     "ONLINE":       (GREEN,  "● ONLINE"),
@@ -746,6 +878,7 @@ class Dashboard(tk.Tk):
         }
 
         self._build_header()
+        self._build_targets()
         self._build_cards()
         self._build_graphs()
         self._build_log()
@@ -776,6 +909,37 @@ class Dashboard(tk.Tk):
         sep = tk.Frame(self, bg=BORDER, height=1)
         sep.grid(row=1, column=0, sticky="ew")
 
+    # ---- target editor ----
+
+    def _build_targets(self):
+        bar = tk.Frame(self, bg=PANEL, pady=6, padx=14)
+        bar.grid(row=2, column=0, sticky="ew")
+
+        def mk(label, initial, on_apply):
+            tk.Label(bar, text=label, bg=PANEL, fg=MUTED,
+                     font=self.fonts["small"]).pack(side="left", padx=(0, 6))
+            var = tk.StringVar(value=initial or "")
+            ent = tk.Entry(bar, textvariable=var, bg=CARD, fg=TEXT,
+                           insertbackground=TEXT, relief="flat",
+                           font=self.fonts["sub"], width=20)
+            ent.pack(side="left", padx=(0, 18))
+            ent.bind("<Return>", lambda e: on_apply())
+            return var
+
+        self.wan_var = mk("WAN TARGET", self.collector.wan_host, self._apply_targets)
+        self.extra_var = mk("CUSTOM TARGET", self.collector.extra_host, self._apply_targets)
+        self.dns_var = mk("DNS TARGET", self.collector.dns_server, self._apply_dns)
+        tk.Label(bar, text="IP or hostname · press Enter to apply",
+                 bg=PANEL, fg=MUTED, font=self.fonts["tiny"]).pack(side="left")
+
+    def _apply_targets(self):
+        if not self.collector.set_targets(self.wan_var.get(),
+                                          self.extra_var.get().strip() or None):
+            self.state.add_event("WAN target cannot be empty", "warn")
+
+    def _apply_dns(self):
+        self.collector.set_dns(self.dns_var.get())
+
     # ---- stat cards ----
 
     def _card(self, parent, col, title, color):
@@ -793,7 +957,7 @@ class Dashboard(tk.Tk):
 
     def _build_cards(self):
         row = tk.Frame(self, bg=BG)
-        row.grid(row=2, column=0, sticky="ew", padx=8, pady=(8, 0))
+        row.grid(row=3, column=0, sticky="ew", padx=8, pady=(8, 0))
         self.cards = {}
         for col, (key, title, color) in enumerate([
                 ("lan", "LAN LATENCY", CYAN), ("wan", "WAN LATENCY", GREEN),
@@ -807,8 +971,8 @@ class Dashboard(tk.Tk):
 
     def _build_graphs(self):
         body = tk.Frame(self, bg=BG)
-        body.grid(row=3, column=0, sticky="nsew", padx=8, pady=8)
-        self.grid_rowconfigure(3, weight=1)
+        body.grid(row=4, column=0, sticky="nsew", padx=8, pady=8)
+        self.grid_rowconfigure(4, weight=1)
         for c in range(3):
             body.grid_columnconfigure(c, weight=1, uniform="g")
         body.grid_rowconfigure(0, weight=3, uniform="gh")
@@ -816,9 +980,13 @@ class Dashboard(tk.Tk):
 
         self.g_wan = GraphWidget(body, "Internet latency (WAN)", "ms", GREEN,
                                  fonts=self.fonts, bg=CARD)
+        self.g_extra = GraphWidget(body, "Custom target latency", "ms", ROSE,
+                                   fonts=self.fonts, bg=CARD,
+                                   empty_text="not configured — set Custom target")
         self.g_lan = GraphWidget(body, "Router latency (LAN)", "ms", CYAN,
                                  fonts=self.fonts, bg=CARD)
-        self.g_wan.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=4, pady=4)
+        self.g_wan.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.g_extra.grid(row=0, column=1, sticky="nsew", padx=4, pady=4)
         self.g_lan.grid(row=0, column=2, sticky="nsew", padx=4, pady=4)
 
         self.g_jitter = GraphWidget(body, "Jitter", "ms", YELLOW, fonts=self.fonts, bg=CARD)
@@ -831,7 +999,7 @@ class Dashboard(tk.Tk):
 
     def _build_log(self):
         bar = tk.Frame(self, bg=PANEL)
-        bar.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        bar.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
         tk.Label(bar, text="EVENT LOG", bg=PANEL, fg=MUTED,
                  font=self.fonts["card"]).pack(side="left")
         self.pause_btn = tk.Button(bar, text="Pause", command=self._toggle_pause, bg=CARD,
@@ -850,7 +1018,7 @@ class Dashboard(tk.Tk):
 
         self.log = tk.Text(self, bg=PANEL, fg=TEXT, height=7, relief="flat",
                            font=self.fonts["sub"], state="disabled", padx=10, pady=6)
-        self.log.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 10))
+        self.log.grid(row=6, column=0, sticky="ew", padx=8, pady=(0, 10))
         for tag, color in (("good", GREEN), ("bad", RED), ("warn", YELLOW), ("info", MUTED)):
             self.log.tag_configure(tag, foreground=color)
 
@@ -898,7 +1066,8 @@ class Dashboard(tk.Tk):
         self.clock_lbl.config(text=time.strftime("%H:%M:%S"))
 
         with st.lock:
-            lan, wan, dns, sig = (list(st.lan), list(st.wan), list(st.dns), list(st.signal))
+            lan, wan, dns, sig, extra = (list(st.lan), list(st.wan), list(st.dns),
+                                         list(st.signal), list(st.extra))
             counts = dict(st.counts)
             wifi, wifi_avail = st.wifi, st.wifi_available
             events = list(st.events)
@@ -941,9 +1110,13 @@ class Dashboard(tk.Tk):
             extra = (wifi.get("channel") or wifi.get("band") or "") if wifi else ""
             set_card("signal", f"{sig[-1].v:.0f} %", extra or "signal quality", color=BLUE)
         else:
-            set_card("signal", "—", "needs admin rights" if wifi_avail is False else "no data")
-        self.g_signal.empty_text = ("run as Administrator for WiFi data"
-                                    if wifi_avail is False else "waiting for data…")
+            set_card("signal", "—",
+                     "needs admin rights" if wifi_avail is False and IS_WINDOWS
+                     else ("unavailable on this platform" if wifi_avail is False else "no data"))
+        self.g_signal.empty_text = (
+            "run as Administrator for WiFi data" if (wifi_avail is False and IS_WINDOWS)
+            else ("not available on this platform" if wifi_avail is False
+                  else "waiting for data…"))
 
         shown_dns = st.dns_server if self.collector.dns_server == "auto" else self.collector.dns_server
         set_card("dns", f"{dns_v[-1]:.1f} ms" if dns_v else "—",
@@ -985,6 +1158,7 @@ class Dashboard(tk.Tk):
         self.g_wan.set_data(wan[-window:])
         self.g_lan.set_data(lan[-window:])
         self.g_dns.set_data(dns[-window:])
+        self.g_extra.set_data(extra[-window:])
         # jitter series: |Δ| between consecutive present samples
         js = []
         prev_t = prev_v = None
@@ -1025,8 +1199,11 @@ class Dashboard(tk.Tk):
 def headless(state: State, collector: Collector, seconds: float = 5.0):
     collector.start()
     time.sleep(seconds)
+    series = [("LAN", state.lan), ("WAN", state.wan), ("DNS", state.dns)]
+    if state.extra_host:
+        series.insert(2, ("CUSTOM", state.extra))
     with state.lock:
-        for name, deq in (("LAN", state.lan), ("WAN", state.wan), ("DNS", state.dns)):
+        for name, deq in series:
             vals = [s.v for s in deq if s.v is not None]
             print(f"{name}: {len(deq)} samples, {len(vals)} ok"
                   + (f", avg {statistics.fmean(vals):.1f} ms" if vals else ""))
@@ -1039,7 +1216,10 @@ def main():
     ap = argparse.ArgumentParser(description="WiFi / Network Monitor")
     ap.add_argument("--interval", type=float, default=1.0, help="probe interval seconds")
     ap.add_argument("--window", type=int, default=300, help="history window (samples)")
-    ap.add_argument("--wan", default="1.1.1.1", help="WAN probe host (IP)")
+    ap.add_argument("--wan", default="1.1.1.1", help="WAN probe host (IP or hostname)")
+    ap.add_argument("--extra", default=None,
+                    help="optional custom probe target (IP or hostname, "
+                         "e.g. an internal routed hop)")
     ap.add_argument("--dns-server", default="auto",
                     help="DNS probe server ('auto' = use system DNS)")
     ap.add_argument("--dns-name", default="www.google.com", help="DNS probe name")
@@ -1047,7 +1227,8 @@ def main():
     args = ap.parse_args()
 
     state = State(args.window)
-    collector = Collector(state, args.interval, args.wan, args.dns_server, args.dns_name)
+    collector = Collector(state, args.interval, args.wan, args.dns_server,
+                          args.dns_name, args.extra)
 
     if args.no_gui:
         headless(state, collector)

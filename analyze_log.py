@@ -52,7 +52,8 @@ def load(paths):
                             "wan": float(r["wan_ms"]) if r["wan_ms"] else None,
                             "dns": float(r["dns_ms"]) if r["dns_ms"] else None,
                             "dns_server": r.get("dns_server", ""),
-                            "signal": int(float(r["signal_pct"])) if r["signal_pct"] else None,
+                            "signal": int(float(r["signal_pct"])) if r.get("signal_pct") else None,
+                            "extra": float(r["extra_ms"]) if r.get("extra_ms") else None,
                         })
                     except (KeyError, ValueError):
                         continue  # tolerate truncated/partial lines
@@ -91,7 +92,10 @@ def report(rows):
     online = sum(1 for r in rows if r["wan"] is not None)
     routed = sum(1 for r in rows if r["lan"] is not None)
     print(f"Uptime  : internet {100*online/len(rows):.1f}%  |  router {100*routed/len(rows):.1f}%")
-    for label, key in (("LAN", "lan"), ("WAN", "wan"), ("DNS", "dns")):
+    series_list = [("LAN", "lan"), ("WAN", "wan"), ("DNS", "dns")]
+    if any(r.get("extra") is not None for r in rows):
+        series_list.append(("CUSTOM", "extra"))
+    for label, key in series_list:
         s = stats(rows, key)
         if s:
             print(f"{label:4}    : n={s['n']:<5} loss={s['loss']:5.1f}%  "
