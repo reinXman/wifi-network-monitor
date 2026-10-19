@@ -15,3 +15,4 @@ netlog_*.csv
 # OS / editor
 .DS_Store
 Thumbs.db
+AGENTS.md
