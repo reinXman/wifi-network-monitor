@@ -59,7 +59,7 @@ button{font:inherit;color:inherit}
 #ov{display:block;width:100%;touch-action:none;user-select:none;-webkit-user-select:none}
 
 /* stat cards */
-.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.cards{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0}
 .card .l{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:0}
 .card .l span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -113,12 +113,12 @@ footer{font-size:12px;color:var(--muted);padding:4px;max-width:90ch}
 
 @media (max-width:1000px){
   .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .cards{grid-template-columns:repeat(3,minmax(0,1fr))}
   .notes{grid-template-columns:minmax(0,1fr)}
 }
 @media (max-width:640px){
   .grid{grid-template-columns:minmax(0,1fr)}
-  .cards{grid-template-columns:minmax(0,1fr)}
+  .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
   .meta{margin-left:0;text-align:left}
   .events li{grid-template-columns:62px minmax(0,1fr)}
   .events li .tag{grid-column:2;grid-row:1}
@@ -731,12 +731,12 @@ ov.draw = function () {
 let cardEls = {};
 function buildCards() {
   const CARDS = [
-    { id: 'wan', label: 'WAN latency', color: 'var(--wan)' },
-    { id: 'custom', label: 'Custom ' + D.extra, color: 'var(--custom)' },
     { id: 'lan', label: 'LAN latency', color: 'var(--lan)' },
+    { id: 'wan', label: 'WAN latency', color: 'var(--wan)' },
     { id: 'jitter', label: 'Jitter', color: 'var(--jitter)' },
-    { id: 'beyond', label: 'Beyond router', color: 'var(--beyond)' },
-    { id: 'dns', label: 'DNS latency', color: 'var(--dns)' }
+    { id: 'loss', label: 'Packet loss', color: 'var(--wan)' },
+    { id: 'dns', label: 'DNS latency', color: 'var(--dns)' },
+    { id: 'custom', label: 'Custom ' + D.extra, color: 'var(--custom)' }
   ];
   cardEls = {};
   const host = $('#cards');
@@ -760,8 +760,9 @@ function updateCards() {
     const s = stats(SER[key], i0, i1);
     setCard(id, num(s.avg), 'ms avg', `p95 ${num(s.p95)} \u00b7 max ${num(s.max)}${extra && s.lost ? ' \u00b7 ' + s.lost + ' failed' : ''}`);
   };
-  one('wan', 'wan', true); one('custom', 'custom'); one('lan', 'lan');
-  one('jitter', 'jitter'); one('beyond', 'beyond'); one('dns', 'dns', true);
+  one('lan', 'lan'); one('wan', 'wan'); one('jitter', 'jitter'); one('dns', 'dns', true); one('custom', 'custom');
+  const w = stats(SER.wan, i0, i1), total = i1 - i0;
+  setCard('loss', (100 * w.lost / total).toFixed(1), '%', `${w.lost} of ${fmtInt(total)} WAN probes lost`);
 }
 
 /* ---------- header ---------- */
