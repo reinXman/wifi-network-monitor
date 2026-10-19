@@ -1,0 +1,985 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Network Monitor Log Analyzer</title>
+<style>
+/* Layout: a replay of the live dashboard. Header and target bar, a range strip with an overview you can drag,
+   six stat cards, six panels in a 3x2 grid, session notes, a derived event log and a table twin of the charts.
+   One dark look on purpose: it mirrors the desktop app. */
+:root{
+  color-scheme: dark;
+  --page:#0b0f14; --panel:#11161d; --card:#151c26; --border:#263041; --grid:#1f2837; --axis:#34405a;
+  --ink:#e6edf3; --ink-2:#b8c1cc; --muted:#8b949e;
+  --wan:#07b25a; --lan:#0390a4; --dns:#a96ee3; --custom:#e25b71; --beyond:#4c91e4; --jitter:#b58704;
+  --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+  --sans:"Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+  --mono:Consolas,"SF Mono",ui-monospace,Menlo,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  background:var(--page);color:var(--ink);font:14px/1.45 var(--sans);
+  padding-block:18px 40px;
+  padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px));
+}
+.wrap{max-width:1360px;margin:0 auto;display:flex;flex-direction:column;gap:10px}
+button{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--beyond);outline-offset:2px}
+
+/* header */
+.bar{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px 14px}
+.head{display:flex;flex-wrap:wrap;align-items:center;gap:8px 18px}
+.brand{display:flex;align-items:baseline;gap:10px;min-width:0}
+.app{font-weight:700;font-size:13px;letter-spacing:.09em}
+.brand .sub{color:var(--muted);font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:8px;font-weight:700;font-size:13px;letter-spacing:.04em}
+.pill .ic{width:16px;height:16px;border-radius:50%;background:var(--good);color:#06130a;font-size:11px;line-height:16px;text-align:center;font-weight:800}
+.pill.warn .ic{background:var(--warn)}
+.pillnote{color:var(--muted);font-size:12px;font-weight:400;letter-spacing:0}
+.meta{margin-left:auto;color:var(--ink-2);font:12px var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+.targets{display:flex;flex-wrap:wrap;gap:6px 22px;font-size:11px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;padding:2px 4px}
+.targets b{font:500 12px var(--mono);letter-spacing:0;text-transform:none;color:var(--ink-2);margin-left:6px}
+
+/* range strip */
+.range{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px 14px 8px;display:flex;flex-direction:column;gap:8px}
+.rrow{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px}
+.lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.seg{display:inline-flex}
+.seg button{background:var(--card);border:1px solid var(--border);padding:5px 12px;font-size:12px;cursor:pointer;color:var(--ink-2);margin-left:-1px}
+.seg button:first-child{border-radius:5px 0 0 5px;margin-left:0}
+.seg button:last-child{border-radius:0 5px 5px 0}
+.seg button[aria-pressed="true"]{background:var(--border);color:var(--ink);font-weight:600;position:relative}
+.seg button:hover{color:var(--ink)}
+.reset{background:none;border:0;color:var(--beyond);font-size:12px;cursor:pointer;padding:4px 2px;text-decoration:underline;text-underline-offset:3px}
+.rlabel{font:12px var(--mono);color:var(--ink-2);font-variant-numeric:tabular-nums}
+.spacer{margin-left:auto}
+.legend{display:flex;gap:16px;align-items:center;font-size:12px;color:var(--ink-2)}
+.legend i,.key{display:inline-block;width:14px;height:2px;border-radius:1px;background:var(--c);vertical-align:middle}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.hint{font-size:11px;color:var(--muted)}
+#ovwrap{width:100%;min-width:0}
+#ov{display:block;width:100%;touch-action:none;user-select:none;-webkit-user-select:none}
+
+/* stat cards */
+.cards{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0}
+.card .l{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:0}
+.card .l span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card .v{font-weight:600;font-size:26px;line-height:1.15;margin-top:4px;white-space:nowrap}
+.card .v small{font-size:13px;font-weight:400;color:var(--muted);margin-left:4px}
+.card .s{font:11px var(--mono);color:var(--muted);margin-top:2px;font-variant-numeric:tabular-nums}
+
+/* panels */
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.panel{margin:0;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 6px 4px;min-width:0}
+.phead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:0 8px 2px;min-width:0}
+.ptitle{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:0}
+.ptitle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pval{font:12px var(--mono);color:var(--ink-2);font-variant-numeric:tabular-nums;white-space:nowrap}
+.plotwrap{width:100%;min-width:0}
+svg.plot{display:block;width:100%;touch-action:pan-y}
+svg text{font-family:var(--sans)}
+
+/* notes */
+.notes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.note{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px 14px;font-size:13px;color:var(--ink-2);min-width:0}
+.note b{display:block;color:var(--ink);font-size:13px;margin-bottom:3px}
+.noteshead{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:2px 4px 0}
+
+/* events and table */
+.box{background:var(--card);border:1px solid var(--border);border-radius:6px}
+.boxhead{display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;padding:10px 14px 6px}
+.events{list-style:none;margin:0;padding:0 14px 10px;max-height:430px;overflow:auto}
+.events li{display:grid;grid-template-columns:70px 78px minmax(0,1fr);gap:10px;padding:4px 0;border-top:1px solid var(--grid);font-size:13px;align-items:baseline}
+.events li:first-child{border-top:0}
+.when{font:12px var(--mono);color:var(--muted);font-variant-numeric:tabular-nums}
+.tag{font-size:12px;color:var(--ink-2);white-space:nowrap}
+.tag i{font-style:normal;font-weight:800;margin-right:4px}
+.tag.warn i{color:var(--warn)} .tag.bad i{color:var(--bad)} .tag.good i{color:var(--good)} .tag.info i{color:var(--muted)}
+.empty{padding:6px 14px 14px;color:var(--muted);font-size:13px}
+.tablewrap{overflow:auto;max-height:560px}
+table{border-collapse:collapse;width:100%;font:12px var(--mono);font-variant-numeric:tabular-nums}
+th,td{padding:5px 12px;text-align:right;white-space:nowrap;border-top:1px solid var(--grid)}
+th{position:sticky;top:0;background:var(--panel);color:var(--muted);font:500 11px var(--sans);letter-spacing:.06em;text-transform:uppercase;border-top:0}
+th:first-child,td:first-child{text-align:left}
+tbody tr:hover td{background:var(--panel)}
+footer{font-size:12px;color:var(--muted);padding:4px;max-width:90ch}
+
+/* tooltip */
+#tip{position:fixed;z-index:20;pointer-events:none;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px 10px;min-width:176px;box-shadow:0 6px 18px rgba(0,0,0,.5);font-size:12px}
+#tip .tt{font:12px var(--mono);color:var(--ink-2);margin-bottom:4px;font-variant-numeric:tabular-nums}
+.trow{display:grid;grid-template-columns:14px 62px minmax(0,1fr);gap:8px;align-items:center;margin-top:3px}
+.tval{font:600 12px var(--mono);color:var(--ink);text-align:right;font-variant-numeric:tabular-nums}
+.tval.none{font-weight:400;color:var(--muted)}
+.tname{color:var(--muted);white-space:nowrap}
+
+@media (max-width:1000px){
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .cards{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .notes{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:640px){
+  .grid{grid-template-columns:minmax(0,1fr)}
+  .cards{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .meta{margin-left:0;text-align:left}
+  .events li{grid-template-columns:62px minmax(0,1fr)}
+  .events li .tag{grid-column:2;grid-row:1}
+  .events li .msg{grid-column:2}
+}
+
+/* loader */
+[hidden]{display:none!important}
+.loaderwrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--page);z-index:10;padding:16px}
+.loaderbox{width:min(560px,100%);display:flex;flex-direction:column;gap:14px;text-align:center}
+.loaderbrand{font-weight:700;font-size:13px;letter-spacing:.09em;color:var(--ink-2)}
+.loadertitle{font-size:22px;font-weight:600;color:var(--ink)}
+.drop{display:flex;flex-direction:column;gap:6px;align-items:center;justify-content:center;min-height:170px;border:1.5px dashed var(--border);border-radius:10px;background:var(--panel);cursor:pointer;padding:20px;transition:border-color .15s,background .15s}
+.drop:hover,.drop.over{border-color:var(--beyond);background:var(--card)}
+.dropbig{font-size:15px;color:var(--ink)}
+.dropbig b{color:var(--beyond)}
+.drophint{font-size:12px;color:var(--muted)}
+.sessrow{display:flex;align-items:center;gap:10px;justify-content:center}
+.sessrow select{background:var(--card);color:var(--ink);border:1px solid var(--border);border-radius:5px;padding:6px 10px;font:inherit;max-width:100%}
+.loadmsg{font:12px var(--mono);color:var(--warn);min-height:16px}
+</style></head><body>
+<div id="loader" class="loaderwrap">
+  <div class="loaderbox">
+    <div class="loaderbrand">NETWORK MONITOR</div>
+    <div class="loadertitle">Session log analyzer</div>
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".csv,text/csv" multiple hidden>
+      <span class="dropbig">Drop <b>netlog_*.csv</b> files here</span>
+      <span class="drophint">or click to browse &middot; files are read locally, nothing is uploaded</span>
+    </label>
+    <div class="sessrow" id="sessRow" hidden>
+      <span class="lbl">Session</span>
+      <select id="sessSel"></select>
+    </div>
+    <div class="loadmsg" id="loadMsg" role="status"></div>
+  </div>
+</div>
+
+<div class="wrap" id="dash" hidden>
+
+  <header class="bar head">
+    <div class="brand"><span class="app">NETWORK MONITOR</span><span class="sub">session log</span></div>
+    <div class="pill" id="status"><span class="ic" aria-hidden="true">&#10003;</span><span id="statusLbl">ONLINE</span><span class="pillnote" id="statusNote"></span></div>
+    <div class="meta" id="meta"></div>
+  </header>
+  <div class="targets" id="targets"></div>
+
+  <section class="range" aria-label="Time range">
+    <div class="rrow">
+      <span class="lbl">Range</span>
+      <div class="seg" role="group" aria-label="Range presets">
+        <button type="button" id="pFull">Full session</button>
+        <button type="button" id="pFirst">First 15 min</button>
+        <button type="button" id="pLast">Last 15 min</button>
+      </div>
+      <button type="button" class="reset" id="reset" hidden>Reset zoom</button>
+      <span class="rlabel" id="rlabel" aria-live="polite"></span>
+      <span class="spacer"></span>
+      <div class="seg" role="group" aria-label="View">
+        <button type="button" id="vCharts" aria-pressed="true">Charts</button>
+        <button type="button" id="vTable" aria-pressed="false">Table</button>
+      </div>
+      <div class="seg" role="group" aria-label="Open">
+        <button type="button" id="openBtn">Open log&hellip;</button>
+      </div>
+    </div>
+    <div class="rrow">
+      <div class="legend" aria-hidden="true">
+        <span><i style="--c:var(--wan)"></i>WAN</span>
+        <span><i style="--c:var(--lan)"></i>LAN</span>
+      </div>
+      <span class="hint">Drag across the strip to zoom. Drag the edges or the middle to adjust, double-click to reset. Drop a CSV anywhere to open it.</span>
+    </div>
+    <div id="ovwrap"><svg id="ov" role="img" aria-label="Overview of LAN and WAN latency for the whole session"></svg></div>
+  </section>
+
+  <section class="cards" id="cards" aria-label="Summary for the selected range"></section>
+
+  <section id="chartsView" aria-label="Charts">
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <section id="tableView" class="box" hidden aria-label="Table view">
+    <div class="boxhead"><span class="lbl">Table view</span><span class="hint" id="tableNote"></span></div>
+    <div class="tablewrap"><table id="tbl"></table></div>
+  </section>
+
+  <section class="box" aria-label="Events">
+    <div class="boxhead"><span class="lbl">Event log</span><span class="hint">Derived from the CSV for the selected range. The app's own event log is not saved in the file.</span></div>
+    <ul class="events" id="events"></ul>
+  </section>
+
+  <footer>Jitter is the mean change between consecutive WAN samples, as in the app. Percentiles match analyze_log.py. LAN, WAN and custom readings are whole milliseconds because Windows reports whole milliseconds, so 0 ms means under 1 ms. The custom-target panel appears only when the CSV has extra_ms samples.</footer>
+</div>
+
+<div id="tip" hidden></div>
+
+<script>
+(() => {
+'use strict';
+
+/* ================= CSV loading ================= */
+
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+      else field += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = ''; rows.push(row); row = [];
+    } else field += c;
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function csvToLog(name, text) {
+  const rows = parseCSV(text);
+  if (rows.length < 2) throw new Error('no data rows');
+  const col = new Map();
+  rows[0].forEach((h, i) => { h = h.trim(); if (!col.has(h)) col.set(h, i); });
+  const get = (r, k) => { const i = col.get(k); return i == null ? '' : (r[i] == null ? '' : String(r[i]).trim()); };
+  const samples = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.length < 3) continue;
+    const epoch = parseFloat(get(r, 'epoch'));
+    if (!isFinite(epoch)) continue;
+    const fv = k => { const v = parseFloat(get(r, k)); return isFinite(v) ? v : null; };
+    samples.push({
+      epoch,
+      iso: get(r, 'time_iso'),
+      gateway: get(r, 'gateway'),
+      dnsServer: get(r, 'dns_server'),
+      extraTarget: get(r, 'extra_target'),
+      lan: fv('lan_ms'), wan: fv('wan_ms'), dns: fv('dns_ms'), extra: fv('extra_ms')
+    });
+  }
+  if (!samples.length) throw new Error('no usable samples (is this a netlog CSV?)');
+  samples.sort((a, b) => a.epoch - b.epoch);
+  const s0 = samples[0];
+  const tm = /(\d{2}):(\d{2}):(\d{2})/.exec(s0.iso);
+  const sod0 = (tm ? (+tm[1]) * 3600 + (+tm[2]) * 60 + (+tm[3]) : ((s0.epoch % 86400) + 86400) % 86400)
+             + (s0.epoch - Math.floor(s0.epoch));
+  const dm = /^\d{4}-\d{2}-\d{2}/.exec(s0.iso);
+  const withTarget = samples.find(s => s.extraTarget);
+  return {
+    name, date: dm ? dm[0] : '', sod0, t0: s0.epoch,
+    gateway: s0.gateway || '\u2014',
+    dnsServer: s0.dnsServer || '\u2014',
+    extra: (withTarget && withTarget.extraTarget) || 'Custom',
+    dt: samples.map(s => Math.round((s.epoch - s0.epoch) * 1000)),
+    lan: samples.map(s => s.lan),
+    wan: samples.map(s => s.wan),
+    dns: samples.map(s => s.dns),
+    custom: samples.map(s => s.extra)
+  };
+}
+
+/* ================= state ================= */
+
+let D = null, N = 0, T = [];
+let SER = null;
+let state = { i0: 0, i1: 0, view: 'charts' };
+let panels = [];
+let EVENTS = [];
+let SESSIONS = [];
+
+// <stats>
+function derive(D) {
+  const n = D.dt.length;
+  const S = { wan: D.wan, lan: D.lan, dns: D.dns, custom: D.custom };
+  S.beyond = D.wan.map((w, i) => (w == null || D.lan[i] == null) ? null : w - D.lan[i]);
+  const jit = new Array(n).fill(null);
+  let prev = null;
+  for (let i = 0; i < n; i++) {
+    const w = D.wan[i];
+    if (w == null) { prev = null; continue; }
+    if (prev != null) jit[i] = Math.abs(w - prev);
+    prev = w;
+  }
+  S.jitter = jit;
+  return S;
+}
+function pct(sorted, q) { return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]; }
+function stats(arr, i0, i1) {
+  const v = []; let lost = 0;
+  for (let i = i0; i < i1; i++) { const x = arr[i]; if (x == null) lost++; else v.push(x); }
+  if (!v.length) return { n: 0, lost, min: null, avg: null, p50: null, p95: null, max: null };
+  v.sort((a, b) => a - b);
+  let s = 0; for (const x of v) s += x;
+  return { n: v.length, lost, min: v[0], avg: s / v.length, p50: pct(v, 0.5), p95: pct(v, 0.95), max: v[v.length - 1] };
+}
+// </stats>
+
+function getMETA() {
+  return {
+    wan:    { name: 'WAN',            title: 'Internet latency (WAN)',          color: 'var(--wan)' },
+    lan:    { name: 'LAN',            title: 'Router latency (LAN)',            color: 'var(--lan)' },
+    dns:    { name: 'DNS',            title: 'DNS latency \u00b7 ' + D.dnsServer, color: 'var(--dns)' },
+    custom: { name: D.extra,          title: 'Custom target \u00b7 ' + D.extra,  color: 'var(--custom)' },
+    beyond: { name: 'Beyond router',  title: 'Beyond the router (WAN \u2212 LAN)', color: 'var(--beyond)' },
+    jitter: { name: 'Jitter',         title: 'Jitter',                          color: 'var(--jitter)' }
+  };
+}
+
+/* ---------- helpers ---------- */
+const $ = (s, r = document) => r.querySelector(s);
+const NS = 'http://www.w3.org/2000/svg';
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  if (props) for (const k in props) {
+    if (k === 'class') e.className = props[k];
+    else if (k === 'text') e.textContent = props[k];
+    else e.setAttribute(k, props[k]);
+  }
+  for (const c of kids) if (c != null) e.append(c);
+  return e;
+}
+function sv(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.append(e);
+  return e;
+}
+const p2 = n => String(n).padStart(2, '0');
+function fmtSod(sod, withSec = true) {
+  const hh = Math.floor(sod / 3600) % 24, mm = Math.floor(sod / 60) % 60, ss = sod % 60;
+  return withSec ? `${p2(hh)}:${p2(mm)}:${p2(ss)}` : `${p2(hh)}:${p2(mm)}`;
+}
+// the app writes epoch rounded to the millisecond, so a sample at 19.9996 s is stored as .000 of the next second
+// while its text time stays at 19; the small offset keeps the page's clock identical to the CSV's time column
+function clock(t, withSec = true) { return fmtSod(Math.floor(D.sod0 + t - 0.0005), withSec); }
+function dur(sec) {
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  if (h) return `${h} h ${m} min`;
+  if (m) return s ? `${m} min ${s} s` : `${m} min`;
+  return `${s} s`;
+}
+const num = v => v == null ? '\u2014' : v.toFixed(1);
+const fmtInt = n => n.toLocaleString('en-US');
+const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'], MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function dateLabel(iso) {
+  if (!iso) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return `${DAYS[dt.getUTCDay()]} ${d} ${MONTHS[m - 1]} ${y}`;
+}
+function lowerBound(t) {
+  let lo = 0, hi = N;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (T[mid] < t) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+function nearest(t, lo, hi) {
+  let i = lowerBound(t);
+  if (i >= hi) i = hi - 1;
+  if (i < lo) i = lo;
+  if (i > lo && Math.abs(T[i - 1] - t) < Math.abs(T[i] - t)) i--;
+  return i;
+}
+function niceScale(lo, hi, target = 4) {
+  if (hi <= lo) hi = lo + 1;
+  const raw = (hi - lo) / target, mag = Math.pow(10, Math.floor(Math.log10(raw))), norm = raw / mag;
+  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : (norm <= 2.5 && mag >= 10) ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+  const nlo = Math.floor(lo / step) * step, nhi = Math.ceil(hi / step) * step;
+  const ticks = [];
+  for (let v = nlo; v <= nhi + step / 2; v += step) ticks.push(+v.toFixed(6));
+  return { lo: nlo, hi: nhi, ticks };
+}
+function timeTicks(t0, t1, maxTicks = 7) {
+  const span = t1 - t0, steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+  const st = steps.find(s => span / s <= maxTicks) || 3600;
+  const out = [];
+  for (let k = Math.ceil((D.sod0 + t0) / st); k * st - D.sod0 <= t1 + 1e-6; k++) out.push({ t: k * st - D.sod0, label: fmtSod(k * st, st < 60) });
+  return out;
+}
+function linePath(pts) {
+  let d = '', pen = false;
+  for (const p of pts) {
+    if (!p) { pen = false; continue; }
+    d += (pen ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1);
+    pen = true;
+  }
+  return d;
+}
+
+const ORDER = ['wan', 'lan', 'dns', 'custom', 'beyond', 'jitter'];
+
+/* ---------- tooltip ---------- */
+const tip = $('#tip');
+const tipTime = el('div', { class: 'tt' });
+let tipRows = {};
+function buildTip() {
+  tip.replaceChildren(tipTime);
+  tipRows = {};
+  const M = getMETA();
+  for (const k of ORDER) {
+    const val = el('span', { class: 'tval' });
+    tipRows[k] = val;
+    tip.append(el('div', { class: 'trow' },
+      el('span', { class: 'key', style: `--c:${M[k].color}` }), val, el('span', { class: 'tname', text: M[k].name })));
+  }
+}
+function showTip(i, cx, cy) {
+  tipTime.textContent = clock(T[i]);
+  for (const k of ORDER) {
+    const v = SER[k][i], c = tipRows[k];
+    if (v == null) {
+      c.textContent = k === 'jitter' ? '\u2014' : '\u2715 no reply';
+      c.className = 'tval none';
+    } else { c.textContent = num(v) + ' ms'; c.className = 'tval'; }
+  }
+  tip.hidden = false;
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = cx + 16, y = cy - h - 12;
+  if (x + w > window.innerWidth - 8) x = cx - w - 16;
+  if (x < 8) x = 8;
+  if (y < 8) y = cy + 18;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+function hideTip() { tip.hidden = true; }
+
+/* ---------- panels ---------- */
+function hoverAll(i, cx, cy) {
+  for (const p of panels) p.setHover(i);
+  if (i == null) hideTip(); else showTip(i, cx, cy);
+}
+
+function makePanel(key, h) {
+  const m = getMETA()[key];
+  const val = el('span', { class: 'pval' });
+  const svg = sv('svg', { class: 'plot', role: 'img', tabindex: '0' });
+  const wrap = el('div', { class: 'plotwrap' });
+  wrap.append(svg);
+  const root = el('figure', { class: 'panel' },
+    el('figcaption', { class: 'phead' },
+      el('div', { class: 'ptitle' }, el('span', { class: 'key', style: `--c:${m.color}` }), el('span', { text: m.title })), val),
+    wrap);
+  const P = { key, root, svg, wrap, val, sc: null, avgText: '', hv: null, vl: null, dot: null, kb: null };
+
+  P.draw = function () {
+    const W = Math.max(180, Math.floor(wrap.clientWidth));
+    if (!wrap.clientWidth) return;
+    svg.setAttribute('viewBox', `0 0 ${W} ${h}`); svg.setAttribute('width', W); svg.setAttribute('height', h);
+    svg.replaceChildren();
+    const ml = 40, mr = 16, mt = 8, mb = 22, pw = W - ml - mr, ph = h - mt - mb;
+    const arr = SER[key], { i0, i1 } = state;
+    const t0 = T[i0]; let t1 = T[i1 - 1]; if (t1 <= t0) t1 = t0 + 1;
+    let lo = Infinity, hi = -Infinity;
+    for (let i = i0; i < i1; i++) { const v = arr[i]; if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; } }
+    if (!isFinite(lo)) { lo = 0; hi = 10; }
+    const sc = niceScale(key === 'beyond' ? Math.min(0, lo) : 0, hi <= 0 ? 1 : hi * 1.04);
+    const X = t => ml + (t - t0) / (t1 - t0) * pw, Y = v => mt + ph - (v - sc.lo) / (sc.hi - sc.lo) * ph;
+    P.sc = { X, Y, t0, t1, ml, pw, mt, ph };
+
+    // grid and y labels
+    for (const v of sc.ticks) {
+      const y = Y(v);
+      sv('line', { x1: ml, x2: ml + pw, y1: y, y2: y, stroke: v === sc.lo ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }, svg);
+      const lab = sv('text', { x: ml - 6, y: y + 3.5, 'text-anchor': 'end', 'font-size': 10, fill: 'var(--muted)' }, svg);
+      lab.textContent = Number.isInteger(v) ? String(v) : v.toFixed(1);
+    }
+    if (key === 'beyond' && sc.lo < 0) sv('line', { x1: ml, x2: ml + pw, y1: Y(0), y2: Y(0), stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
+    // x labels
+    for (const tk of timeTicks(t0, t1)) {
+      const x = X(tk.t);
+      sv('line', { x1: x, x2: x, y1: mt + ph, y2: mt + ph + 3, stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
+      const lab = sv('text', { x, y: h - 6, 'text-anchor': 'middle', 'font-size': 10, fill: 'var(--muted)' }, svg);
+      lab.textContent = tk.label;
+    }
+
+    // series
+    const n = i1 - i0, color = m.color;
+    if (n > pw * 1.2) {
+      const cols = Math.max(2, Math.floor(pw));
+      const mn = new Float64Array(cols).fill(Infinity), mx = new Float64Array(cols).fill(-Infinity), sm = new Float64Array(cols), cn = new Uint16Array(cols);
+      for (let i = i0; i < i1; i++) {
+        const v = arr[i]; if (v == null) continue;
+        const c = Math.min(cols - 1, Math.floor((T[i] - t0) / (t1 - t0) * (cols - 1)));
+        if (v < mn[c]) mn[c] = v; if (v > mx[c]) mx[c] = v; sm[c] += v; cn[c]++;
+      }
+      const cx = c => ml + c / (cols - 1) * pw;
+      let band = '', mean = [], run = [];
+      const flush = () => {
+        if (run.length) {
+          band += 'M' + run.map(c => cx(c).toFixed(1) + ' ' + Y(mx[c]).toFixed(1)).join('L') +
+                  'L' + run.slice().reverse().map(c => cx(c).toFixed(1) + ' ' + Y(mn[c]).toFixed(1)).join('L') + 'Z';
+          run = [];
+        }
+      };
+      for (let c = 0; c < cols; c++) {
+        if (cn[c]) { run.push(c); mean.push([cx(c), Y(sm[c] / cn[c])]); } else { flush(); mean.push(null); }
+      }
+      flush();
+      sv('path', { d: band, fill: color, 'fill-opacity': 0.2, stroke: 'none' }, svg);
+      sv('path', { d: linePath(mean), fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+    } else {
+      const pts = [];
+      for (let i = i0; i < i1; i++) pts.push(arr[i] == null ? null : [X(T[i]), Y(arr[i])]);
+      let seg = [];
+      const area = () => {
+        if (seg.length > 1) {
+          sv('path', { d: 'M' + seg[0][0].toFixed(1) + ' ' + Y(sc.lo) + 'L' + seg.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join('L') + 'L' + seg[seg.length - 1][0].toFixed(1) + ' ' + Y(sc.lo) + 'Z', fill: color, 'fill-opacity': 0.1, stroke: 'none' }, svg);
+        }
+        seg = [];
+      };
+      for (const p of pts) { if (p) seg.push(p); else area(); }
+      area();
+      sv('path', { d: linePath(pts), fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+    }
+    // lost probes
+    let lostN = 0;
+    for (let i = i0; i < i1; i++) {
+      if (arr[i] == null && !(key === 'jitter' || key === 'beyond')) {
+        lostN++;
+        const x = X(T[i]);
+        sv('line', { x1: x, x2: x, y1: mt + ph - 8, y2: mt + ph, stroke: 'var(--bad)', 'stroke-width': 2 }, svg);
+      }
+    }
+    // average
+    const st = stats(arr, i0, i1);
+    P.avgText = st.avg == null ? '' : `avg ${num(st.avg)} ms`;
+    if (st.avg != null) {
+      const ya = Y(st.avg);
+      sv('line', { x1: ml, x2: ml + pw, y1: ya, y2: ya, stroke: color, 'stroke-opacity': 0.7, 'stroke-width': 1, 'stroke-dasharray': '4 4' }, svg);
+      const lab = sv('text', { x: ml + 4, y: ya - 6 < mt + 8 ? ya + 14 : ya - 6, 'text-anchor': 'start', 'font-size': 10, fill: 'var(--ink-2)', stroke: 'var(--card)', 'stroke-width': 3, 'paint-order': 'stroke' }, svg);
+      lab.textContent = P.avgText;
+    }
+    if (lostN) {
+      const lab = sv('text', { x: ml + 4, y: mt + 11, 'font-size': 10, fill: 'var(--ink-2)', stroke: 'var(--card)', 'stroke-width': 3, 'paint-order': 'stroke' }, svg);
+      lab.textContent = `\u2715 ${lostN} lost`;
+    }
+    // hover layer
+    const hv = sv('g', { 'pointer-events': 'none', style: 'display:none' }, svg);
+    P.hv = hv;
+    P.vl = sv('line', { x1: 0, x2: 0, y1: mt, y2: mt + ph, stroke: 'var(--ink)', 'stroke-opacity': 0.4, 'stroke-width': 1 }, hv);
+    P.dot = sv('circle', { r: 4, cx: 0, cy: 0, fill: color, stroke: 'var(--card)', 'stroke-width': 2 }, hv);
+    const hit = sv('rect', { x: ml, y: mt, width: pw, height: ph, fill: 'transparent', style: 'cursor:crosshair' }, svg);
+    const idxAt = e => {
+      const r = svg.getBoundingClientRect();
+      const t = t0 + (e.clientX - r.left - ml) / pw * (t1 - t0);
+      return nearest(t, state.i0, state.i1);
+    };
+    hit.addEventListener('pointermove', e => hoverAll(idxAt(e), e.clientX, e.clientY));
+    hit.addEventListener('pointerleave', () => hoverAll(null));
+    svg.setAttribute('aria-label', `${m.title}. ${P.avgText ? P.avgText + ', ' : ''}max ${num(st.max)} ms, from ${clock(t0)} to ${clock(t1)}. Use the left and right arrow keys to read values.`);
+    P.val.textContent = P.avgText;
+    P.hover = null;
+  };
+
+  P.setHover = function (i) {
+    if (!P.sc || !P.hv) return;
+    if (i == null || i < state.i0 || i >= state.i1) {
+      P.hv.style.display = 'none'; P.val.textContent = P.avgText; P.hover = null; return;
+    }
+    P.hover = i;
+    const x = P.sc.X(T[i]), v = SER[key][i];
+    P.hv.style.display = '';
+    P.vl.setAttribute('x1', x); P.vl.setAttribute('x2', x);
+    if (v == null) P.dot.style.display = 'none';
+    else { P.dot.style.display = ''; P.dot.setAttribute('cx', x); P.dot.setAttribute('cy', P.sc.Y(v)); }
+    P.val.textContent = `${clock(T[i])}  ${v == null ? 'no reply' : num(v) + ' ms'}`;
+  };
+
+  svg.addEventListener('keydown', e => {
+    if (!P.sc) return;
+    const { i0, i1 } = state;
+    let i = P.hover == null ? i0 : P.hover;
+    const step = e.shiftKey ? 10 : 1;
+    if (e.key === 'ArrowRight') i = Math.min(i1 - 1, i + step);
+    else if (e.key === 'ArrowLeft') i = Math.max(i0, i - step);
+    else if (e.key === 'Home') i = i0;
+    else if (e.key === 'End') i = i1 - 1;
+    else if (e.key === 'Escape') { hoverAll(null); return; }
+    else return;
+    e.preventDefault();
+    const r = svg.getBoundingClientRect(), v = SER[key][i];
+    hoverAll(i, r.left + P.sc.X(T[i]), r.top + (v == null ? P.sc.mt + 20 : P.sc.Y(v)));
+  });
+  svg.addEventListener('blur', () => hoverAll(null));
+
+  panels.push(P);
+  return P;
+}
+const grid = $('#grid');
+function buildPanels() {
+  grid.replaceChildren();
+  panels = [];
+  for (const [k, h] of [['wan', 230], ['custom', 230], ['lan', 230], ['jitter', 190], ['beyond', 190], ['dns', 190]]) grid.append(makePanel(k, h).root);
+}
+
+/* ---------- overview with brush ---------- */
+function bucketMeans(arr, cols) {
+  const sm = new Float64Array(cols), cn = new Uint16Array(cols), tEnd = T[N - 1] || 1;
+  for (let i = 0; i < N; i++) {
+    const v = arr[i]; if (v == null) continue;
+    const c = Math.min(cols - 1, Math.floor(T[i] / tEnd * (cols - 1)));
+    sm[c] += v; cn[c]++;
+  }
+  return Array.from(sm, (s, c) => cn[c] ? s / cn[c] : null);
+}
+const ov = { svg: $('#ov'), wrap: $('#ovwrap'), g: null, drag: null };
+ov.draw = function () {
+  const svg = ov.svg, W = Math.max(240, Math.floor(ov.wrap.clientWidth)), H = 92;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`); svg.setAttribute('width', W); svg.setAttribute('height', H);
+  svg.replaceChildren();
+  const ml = 30, mr = 44, mt = 8, mb = 18, pw = W - ml - mr, ph = H - mt - mb, tEnd = T[N - 1];
+  const cols = Math.max(10, Math.floor(pw));
+  const mw = bucketMeans(SER.wan, cols), mlan = bucketMeans(SER.lan, cols);
+  let mx = 0; for (const a of [mw, mlan]) for (const v of a) if (v != null && v > mx) mx = v;
+  const sc = niceScale(0, mx * 1.05, 2);
+  const X = t => ml + t / tEnd * pw, Y = v => mt + ph - (v - sc.lo) / (sc.hi - sc.lo) * ph;
+  ov.g = { ml, pw, mt, ph, tEnd, X };
+  for (const v of sc.ticks) {
+    const y = Y(v);
+    sv('line', { x1: ml, x2: ml + pw, y1: y, y2: y, stroke: v === 0 ? 'var(--axis)' : 'var(--grid)', 'stroke-width': 1 }, svg);
+    const lab = sv('text', { x: ml - 6, y: y + 3.5, 'text-anchor': 'end', 'font-size': 10, fill: 'var(--muted)' }, svg);
+    lab.textContent = String(v);
+  }
+  for (const tk of timeTicks(0, tEnd)) {
+    const x = X(tk.t);
+    sv('line', { x1: x, x2: x, y1: mt + ph, y2: mt + ph + 3, stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
+    const lab = sv('text', { x, y: H - 4, 'text-anchor': 'middle', 'font-size': 10, fill: 'var(--muted)' }, svg);
+    lab.textContent = tk.label;
+  }
+  const cx = c => ml + c / (cols - 1) * pw;
+  const endY = {};
+  for (const [name, arr, col] of [['LAN', mlan, 'var(--lan)'], ['WAN', mw, 'var(--wan)']]) {
+    const pts = arr.map((v, c) => v == null ? null : [cx(c), Y(v)]);
+    sv('path', { d: linePath(pts), fill: 'none', stroke: col, 'stroke-width': 2, 'stroke-linejoin': 'round' }, svg);
+    for (let c = cols - 1; c >= 0; c--) if (arr[c] != null) { endY[name] = Y(arr[c]); break; }
+  }
+  let yl = endY.LAN, yw = endY.WAN;
+  const gap = 12 - Math.abs(yl - yw);
+  if (gap > 0) { const dir = yl >= yw ? 1 : -1; yl += dir * gap / 2; yw -= dir * gap / 2; }
+  for (const [name, y] of [['WAN', yw], ['LAN', yl]]) {
+    const lab = sv('text', { x: ml + pw + 6, y: y + 3.5, 'font-size': 11, fill: 'var(--ink-2)' }, svg);
+    lab.textContent = name;
+  }
+  // selection
+  const xL = X(T[state.i0]), xR = X(T[state.i1 - 1]), full = state.i0 === 0 && state.i1 === N;
+  if (!full) {
+    sv('rect', { x: ml, y: mt, width: Math.max(0, xL - ml), height: ph, fill: 'var(--page)', 'fill-opacity': 0.62 }, svg);
+    sv('rect', { x: xR, y: mt, width: Math.max(0, ml + pw - xR), height: ph, fill: 'var(--page)', 'fill-opacity': 0.62 }, svg);
+    sv('line', { x1: xL, x2: xR, y1: mt + 0.5, y2: mt + 0.5, stroke: 'var(--ink-2)', 'stroke-width': 1 }, svg);
+    sv('line', { x1: xL, x2: xR, y1: mt + ph - 0.5, y2: mt + ph - 0.5, stroke: 'var(--ink-2)', 'stroke-width': 1 }, svg);
+  }
+  for (const x of [xL, xR]) {
+    sv('rect', { x: x - 3, y: mt + ph / 2 - 14, width: 6, height: 28, rx: 3, fill: 'var(--ink-2)', stroke: 'var(--panel)', 'stroke-width': 2 }, svg);
+  }
+};
+(function brush() {
+  const svg = ov.svg;
+  const tAt = e => { const r = svg.getBoundingClientRect(), g = ov.g; return Math.min(g.tEnd, Math.max(0, (e.clientX - r.left - g.ml) / g.pw * g.tEnd)); };
+  const MINN = 20;
+  function mode(e) {
+    if (!ov.g) return 'new';
+    const r = svg.getBoundingClientRect(), g = ov.g, x = e.clientX - r.left;
+    const xl = g.X(T[state.i0]), xr = g.X(T[state.i1 - 1]);
+    const full = state.i0 === 0 && state.i1 === N;
+    if (Math.abs(x - xl) <= 9 && Math.abs(x - xl) <= Math.abs(x - xr)) return 'left';
+    if (Math.abs(x - xr) <= 9) return 'right';
+    if (!full && x > xl && x < xr) return 'move';
+    return 'new';
+  }
+  svg.addEventListener('pointermove', e => {
+    if (ov.drag || !ov.g) return;
+    const m = mode(e);
+    svg.style.cursor = m === 'new' ? 'crosshair' : m === 'move' ? 'grab' : 'ew-resize';
+  });
+  svg.addEventListener('pointerdown', e => {
+    if (!ov.g) return;
+    const m = mode(e), t = tAt(e);
+    ov.drag = { m, t, x: e.clientX, i0: state.i0, i1: state.i1, a: nearest(t, 0, N), moved: false };
+    svg.setPointerCapture(e.pointerId);
+    if (m === 'move') svg.style.cursor = 'grabbing';
+    e.preventDefault();
+  });
+  svg.addEventListener('pointermove', e => {
+    const d = ov.drag; if (!d) return;
+    if (Math.abs(e.clientX - d.x) > 3) d.moved = true;
+    if (!d.moved) return;
+    const t = tAt(e), idx = nearest(t, 0, N);
+    let i0 = d.i0, i1 = d.i1;
+    if (d.m === 'new') { i0 = Math.min(d.a, idx); i1 = Math.max(d.a, idx) + 1; }
+    else if (d.m === 'left') { i0 = Math.min(idx, d.i1 - MINN); }
+    else if (d.m === 'right') { i1 = Math.max(idx + 1, d.i0 + MINN); }
+    else {
+      const count = d.i1 - d.i0;
+      const start = Math.min(Math.max(0, T[d.i0] + (t - d.t)), T[N - 1]);
+      i0 = lowerBound(start); i1 = Math.min(N, i0 + count); i0 = i1 - count;
+    }
+    if (i1 - i0 < MINN) { if (d.m === 'new') i1 = Math.min(N, i0 + MINN), i0 = i1 - MINN; }
+    setRange(Math.max(0, i0), Math.min(N, i1));
+  });
+  const end = e => { if (ov.drag) { try { svg.releasePointerCapture(e.pointerId); } catch (_) {} ov.drag = null; } };
+  svg.addEventListener('pointerup', end);
+  svg.addEventListener('pointercancel', end);
+  svg.addEventListener('dblclick', () => setRange(0, N));
+})();
+
+/* ---------- cards ---------- */
+let cardEls = {};
+function buildCards() {
+  const CARDS = [
+    { id: 'lan', label: 'LAN latency', color: 'var(--lan)' },
+    { id: 'wan', label: 'WAN latency', color: 'var(--wan)' },
+    { id: 'jitter', label: 'Jitter', color: 'var(--jitter)' },
+    { id: 'loss', label: 'Packet loss', color: 'var(--wan)' },
+    { id: 'dns', label: 'DNS latency', color: 'var(--dns)' },
+    { id: 'custom', label: 'Custom ' + D.extra, color: 'var(--custom)' }
+  ];
+  cardEls = {};
+  const host = $('#cards');
+  host.replaceChildren();
+  for (const c of CARDS) {
+    const v = el('div', { class: 'v' }), s = el('div', { class: 's' });
+    cardEls[c.id] = { v, s };
+    host.append(el('div', { class: 'card' },
+      el('div', { class: 'l' }, el('span', { class: 'key', style: `--c:${c.color}` }), el('span', { text: c.label })), v, s));
+  }
+}
+function setCard(id, value, unit, sub) {
+  const c = cardEls[id];
+  c.v.textContent = value;
+  if (unit) c.v.append(el('small', { text: unit }));
+  c.s.textContent = sub;
+}
+function updateCards() {
+  const { i0, i1 } = state;
+  const one = (id, key, extra) => {
+    const s = stats(SER[key], i0, i1);
+    setCard(id, num(s.avg), 'ms avg', `p95 ${num(s.p95)} \u00b7 max ${num(s.max)}${extra && s.lost ? ' \u00b7 ' + s.lost + ' failed' : ''}`);
+  };
+  one('lan', 'lan'); one('wan', 'wan'); one('jitter', 'jitter'); one('dns', 'dns', true); one('custom', 'custom');
+  const w = stats(SER.wan, i0, i1), total = i1 - i0;
+  setCard('loss', (100 * w.lost / total).toFixed(1), '%', `${w.lost} of ${fmtInt(total)} WAN probes lost`);
+}
+
+/* ---------- header ---------- */
+function fillHeader() {
+  let online = 0;
+  for (let i = 0; i < N; i++) if (D.lan[i] != null && D.wan[i] != null) online++;
+  const ok = online === N;
+  $('#statusLbl').textContent = ok ? 'ONLINE' : `${(100 * online / N).toFixed(1)}% ONLINE`;
+  $('#statusNote').textContent = `${fmtInt(online)} of ${fmtInt(N)} samples answered by the router and the WAN target`;
+  if (!ok) { $('#status').classList.add('warn'); $('.ic', $('#status')).textContent = '!'; }
+  $('#meta').textContent = `${dateLabel(D.date)} \u00b7 ${clock(0)} to ${clock(T[N - 1])} \u00b7 ${dur(T[N - 1])} \u00b7 ${fmtInt(N)} samples`;
+  const t = $('#targets');
+  t.replaceChildren();
+  for (const [l, v] of [['Gateway', D.gateway], ['Custom target', D.extra], ['DNS target', D.dnsServer]]) {
+    t.append(el('span', null, l, el('b', { text: v })));
+  }
+}
+
+/* ---------- events (derived) ---------- */
+function rollingMedian(arr, half) {
+  const out = new Array(arr.length).fill(null);
+  for (let i = 0; i < arr.length; i++) {
+    const w = [];
+    for (let j = Math.max(0, i - half); j <= Math.min(arr.length - 1, i + half); j++) if (arr[j] != null) w.push(arr[j]);
+    if (w.length) { w.sort((a, b) => a - b); out[i] = w[w.length >> 1]; }
+  }
+  return out;
+}
+function computeEvents() {
+  const ev = [];
+  ev.push({ i: 0, kind: 'info', text: `Log starts. Gateway ${D.gateway}, custom target ${D.extra}, DNS ${D.dnsServer}.` });
+  const lm = rollingMedian(SER.lan, 15);
+  let high = false;
+  for (let i = 0; i < N; i++) {
+    if (lm[i] == null) continue;
+    if (!high && lm[i] >= 28) { high = true; ev.push({ i, kind: 'warn', text: `Router latency rose to 28 ms or more (30 s median ${lm[i].toFixed(0)} ms).` }); }
+    else if (high && lm[i] <= 15) { high = false; ev.push({ i, kind: 'good', text: `Router latency fell to 15 ms or less (30 s median ${lm[i].toFixed(0)} ms).` }); }
+  }
+  const bm = rollingMedian(SER.beyond, 5);
+  let up = false;
+  for (let i = 0; i < N; i++) {
+    if (bm[i] == null) continue;
+    if (!up && bm[i] >= 30) { up = true; ev.push({ i, kind: 'warn', text: `Delay beyond the router rose to 30 ms or more (WAN minus LAN, 10 s median ${bm[i].toFixed(0)} ms).` }); }
+    else if (up && bm[i] <= 20) { up = false; ev.push({ i, kind: 'good', text: `Delay beyond the router fell back to 20 ms or less.` }); }
+  }
+  for (const [k, name] of [['lan', 'the router'], ['wan', 'the WAN target'], ['custom', D.extra], ['dns', `DNS server ${D.dnsServer}`]]) {
+    let run = 0, start = 0;
+    for (let i = 0; i <= N; i++) {
+      if (i < N && SER[k][i] == null) { if (!run) start = i; run++; }
+      else if (run) { ev.push({ i: start, kind: 'bad', text: run === 1 ? `No reply from ${name}.` : `No reply from ${name} for ${run} samples.` }); run = 0; }
+    }
+  }
+  ev.push({ i: N - 1, kind: 'info', text: 'Log ends.' });
+  ev.sort((a, b) => a.i - b.i);
+  return ev;
+}
+const TAGS = { info: ['\u25cf', 'Info'], warn: ['\u25b2', 'Rise'], good: ['\u2713', 'Back'], bad: ['\u2715', 'Failed'] };
+function renderEvents() {
+  const ul = $('#events'); ul.replaceChildren();
+  const rows = EVENTS.filter(e => e.i >= state.i0 && e.i < state.i1);
+  if (!rows.length) { ul.append(el('li', { class: 'empty', text: 'No events in this range.' })); return; }
+  for (const e of rows) {
+    const [ic, lab] = TAGS[e.kind];
+    ul.append(el('li', null,
+      el('span', { class: 'when', text: clock(T[e.i]) }),
+      el('span', { class: 'tag ' + e.kind }, el('i', { text: ic }), lab),
+      el('span', { class: 'msg', text: e.text })));
+  }
+}
+
+/* ---------- table view ---------- */
+function renderTable() {
+  const { i0, i1 } = state, span = T[i1 - 1] - T[i0], bs = span <= 420 ? 10 : 60;
+  const cols = ['Time', 'LAN avg', 'LAN max', 'WAN avg', 'WAN max', D.extra + ' avg', 'DNS avg', 'DNS max', 'Beyond avg', 'No reply'];
+  const buckets = new Map();
+  for (let i = i0; i < i1; i++) {
+    const b = Math.floor(Math.floor(D.sod0 + T[i] - 0.0005) / bs);
+    if (!buckets.has(b)) buckets.set(b, []);
+    buckets.get(b).push(i);
+  }
+  const tbl = $('#tbl'); tbl.replaceChildren();
+  const thead = el('thead'), hr = el('tr');
+  for (const c of cols) hr.append(el('th', { text: c }));
+  thead.append(hr); tbl.append(thead);
+  const tb = el('tbody');
+  const agg = (idx, arr) => {
+    let s = 0, n = 0, mx = -Infinity, lost = 0;
+    for (const i of idx) { const v = arr[i]; if (v == null) lost++; else { s += v; n++; if (v > mx) mx = v; } }
+    return { avg: n ? s / n : null, max: n ? mx : null, lost };
+  };
+  for (const [b, idx] of buckets) {
+    const L = agg(idx, SER.lan), W = agg(idx, SER.wan), C = agg(idx, SER.custom), Dn = agg(idx, SER.dns), B = agg(idx, SER.beyond);
+    const lost = L.lost + W.lost + C.lost + Dn.lost;
+    const label = fmtSod(b * bs, bs < 60);
+    const tr = el('tr');
+    for (const c of [label, num(L.avg), num(L.max), num(W.avg), num(W.max), num(C.avg), num(Dn.avg), num(Dn.max), num(B.avg), lost ? String(lost) : '0']) tr.append(el('td', { text: c }));
+    tb.append(tr);
+  }
+  tbl.append(tb);
+  $('#tableNote').textContent = `${bs === 60 ? 'One row per minute' : 'One row per 10 seconds'}, in ms. Average and maximum over the samples in each row.`;
+}
+
+/* ---------- range and view ---------- */
+function presetIdx() {
+  return {
+    full: [0, N],
+    first: [0, lowerBound(T[0] + 900)],
+    last: [lowerBound(T[N - 1] - 900), N]
+  };
+}
+function setRange(i0, i1) {
+  i0 = Math.max(0, Math.min(i0, N - 2)); i1 = Math.max(i0 + 2, Math.min(i1, N));
+  state.i0 = i0; state.i1 = i1;
+  render();
+}
+let queued = false;
+function render() {
+  if (queued) return;
+  queued = true;
+  requestAnimationFrame(() => { queued = false; renderNow(); });
+}
+function renderNow() {
+  hideTip();
+  const { i0, i1 } = state, pi = presetIdx();
+  const same = a => a[0] === i0 && a[1] === i1;
+  $('#pFull').setAttribute('aria-pressed', String(same(pi.full)));
+  $('#pFirst').setAttribute('aria-pressed', String(same(pi.first)));
+  $('#pLast').setAttribute('aria-pressed', String(same(pi.last)));
+  $('#reset').hidden = same(pi.full);
+  $('#rlabel').textContent = `${clock(T[i0])} to ${clock(T[i1 - 1])} \u00b7 ${dur(T[i1 - 1] - T[i0])} \u00b7 ${fmtInt(i1 - i0)} samples`;
+  updateCards();
+  ov.draw();
+  if (state.view === 'charts') for (const p of panels) p.draw(); else renderTable();
+  renderEvents();
+}
+function setView(v) {
+  state.view = v;
+  $('#chartsView').hidden = v !== 'charts';
+  $('#tableView').hidden = v !== 'table';
+  $('#vCharts').setAttribute('aria-pressed', String(v === 'charts'));
+  $('#vTable').setAttribute('aria-pressed', String(v === 'table'));
+  render();
+}
+$('#pFull').addEventListener('click', () => setRange(...presetIdx().full));
+$('#pFirst').addEventListener('click', () => setRange(...presetIdx().first));
+$('#pLast').addEventListener('click', () => setRange(...presetIdx().last));
+$('#reset').addEventListener('click', () => setRange(0, N));
+$('#vCharts').addEventListener('click', () => setView('charts'));
+$('#vTable').addEventListener('click', () => setView('table'));
+if ('ResizeObserver' in window) {
+  new ResizeObserver(() => { if (!D) return; ov.draw(); if (state.view === 'charts') for (const p of panels) p.draw(); }).observe(document.querySelector('.wrap'));
+}
+window.addEventListener('scroll', hideTip, { passive: true });
+
+/* ---------- open / load a log ---------- */
+const loadMsg = $('#loadMsg');
+function msg(t) { loadMsg.textContent = t || ''; }
+
+function loadLog(log) {
+  D = log;
+  N = D.dt.length;
+  T = D.dt.map(ms => ms / 1000);
+  SER = derive(D);
+  state = { i0: 0, i1: N, view: state.view };
+  EVENTS = computeEvents();
+  buildTip();
+  buildPanels();
+  buildCards();
+  fillHeader();
+  ov.g = null;
+  $('#dash').hidden = false;
+  $('#loader').hidden = true;
+  renderNow();
+}
+
+function refreshSessSel() {
+  const sel = $('#sessSel');
+  $('#sessRow').hidden = SESSIONS.length < 2;
+  sel.replaceChildren(...SESSIONS.map((s, i) =>
+    el('option', { value: String(i), text: `${s.name} \u2014 ${s.D.date || '?'} \u00b7 ${fmtInt(s.D.dt.length)} samples` })));
+  sel.value = '0';
+  sel.onchange = () => loadLog(SESSIONS[+sel.value].D);
+}
+
+async function openFiles(list) {
+  const files = [...list].filter(f => /\.csv$/i.test(f.name) || f.type === 'text/csv');
+  if (!files.length) { msg('No .csv files found \u2014 drop netlog_*.csv.'); return; }
+  msg(`Reading ${files.length} file${files.length > 1 ? 's' : ''}\u2026`);
+  const logs = [];
+  for (const f of files) {
+    try { logs.push({ name: f.name.replace(/\.csv$/i, ''), D: csvToLog(f.name, await f.text()) }); }
+    catch (e) { msg(`${f.name}: ${e.message}`); }
+  }
+  if (!logs.length) return;
+  logs.sort((a, b) => a.D.t0 - b.D.t0);
+  SESSIONS = logs;
+  refreshSessSel();
+  msg('');
+  loadLog(SESSIONS[0].D);
+}
+
+const dropLabel = $('#drop');
+dropLabel.addEventListener('dragover', e => { e.preventDefault(); dropLabel.classList.add('over'); });
+dropLabel.addEventListener('dragleave', () => dropLabel.classList.remove('over'));
+dropLabel.addEventListener('drop', e => { e.preventDefault(); dropLabel.classList.remove('over'); openFiles(e.dataTransfer.files); });
+$('#file').addEventListener('change', e => { openFiles(e.target.files); e.target.value = ''; });
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  if (dropLabel.contains(e.target)) return; // the label's own handler covers it
+  openFiles(e.dataTransfer.files);
+});
+$('#openBtn').addEventListener('click', () => { $('#loader').hidden = false; });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('#loader').hidden && D) $('#loader').hidden = true;
+});
+})();
+
+</script>
+</body></html>

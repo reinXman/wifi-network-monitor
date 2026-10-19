@@ -16,6 +16,7 @@ Files:
 | `network_monitor.pyw` | **Entry point for double-click** — windowless launcher |
 | `run_admin.bat` | Elevated launch (UAC) for WiFi details on Windows 11 |
 | `analyze_log.py` | Parses CSV logs in `logs/`; also writes `Network Monitor Log.html` |
+| `log.html` | Standalone log analyzer: open/drop `netlog_*.csv`, renders the dashboard client-side |
 | `LOAD_TEST_GUIDE.md` | How to use the load-testing feature |
 
 There is a sibling repo at `D:/Github/dns-benchmark` (DNS Benchmark, same
