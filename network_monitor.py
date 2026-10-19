@@ -1198,7 +1198,7 @@ class Dashboard(tk.Tk):
     def _card(self, parent, col, title, color):
         card = tk.Frame(parent, bg=CARD, highlightthickness=1,
                         highlightbackground=BORDER, padx=12, pady=8)
-        parent.grid_columnconfigure(col, weight=1)
+        parent.grid_columnconfigure(col, weight=1, uniform="c")
         lbl = tk.Label(card, text=title, bg=CARD, fg=MUTED, font=self.fonts["card"])
         lbl.pack(anchor="w", fill="x")
         val = tk.Label(card, text="—", bg=CARD, fg=color, font=self.fonts["big"])
