@@ -81,7 +81,7 @@ python analyze_log.py --plot report.png   # + charts (needs matplotlib)
 
 Prints min/avg/p50/p95/max, loss %, uptime % and jitter per series.
 
-Or open `log.html` in a browser: drag one or more `netlog_*.csv` files onto
+Or open `LogViewer.html` in a browser: drag one or more `netlog_*.csv` files onto
 it (or click to browse) and it renders the full dashboard — charts, stat
 cards, zoomable range strip, table view, derived event log — entirely
 client-side; the file never leaves the machine. Multiple files become a
