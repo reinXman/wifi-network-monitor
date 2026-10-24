@@ -8,6 +8,7 @@
   --page:#0b0f14; --panel:#11161d; --card:#151c26; --border:#263041; --grid:#1f2837; --axis:#34405a;
   --ink:#e6edf3; --ink-2:#b8c1cc; --muted:#8b949e;
   --wan:#07b25a; --lan:#0390a4; --dns:#a96ee3; --custom:#e25b71; --beyond:#4c91e4; --jitter:#b58704;
+  --down:#07b25a; --up:#4c91e4; --score:#e25b71;
   --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
   --sans:"Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
   --mono:Consolas,"SF Mono",ui-monospace,Menlo,"Liberation Mono",monospace;
@@ -59,7 +60,7 @@ button{font:inherit;color:inherit}
 #ov{display:block;width:100%;touch-action:none;user-select:none;-webkit-user-select:none}
 
 /* stat cards */
-.cards{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0}
 .card .l{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:0}
 .card .l span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -70,6 +71,7 @@ button{font:inherit;color:inherit}
 /* panels */
 .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
 .panel{margin:0;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 6px 4px;min-width:0}
+.panel.wide{grid-column:1/-1}
 .phead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:0 8px 2px;min-width:0}
 .ptitle{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);min-width:0}
 .ptitle span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -106,7 +108,7 @@ footer{font-size:12px;color:var(--muted);padding:4px;max-width:90ch}
 /* tooltip */
 #tip{position:fixed;z-index:20;pointer-events:none;background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:8px 10px;min-width:176px;box-shadow:0 6px 18px rgba(0,0,0,.5);font-size:12px}
 #tip .tt{font:12px var(--mono);color:var(--ink-2);margin-bottom:4px;font-variant-numeric:tabular-nums}
-.trow{display:grid;grid-template-columns:14px 62px minmax(0,1fr);gap:8px;align-items:center;margin-top:3px}
+.trow{display:grid;grid-template-columns:14px 74px minmax(0,1fr);gap:8px;align-items:center;margin-top:3px}
 .tval{font:600 12px var(--mono);color:var(--ink);text-align:right;font-variant-numeric:tabular-nums}
 .tval.none{font-weight:400;color:var(--muted)}
 .tname{color:var(--muted);white-space:nowrap}
@@ -260,7 +262,8 @@ function csvToLog(name, text) {
       gateway: get(r, 'gateway'),
       dnsServer: get(r, 'dns_server'),
       extraTarget: get(r, 'extra_target'),
-      lan: fv('lan_ms'), wan: fv('wan_ms'), dns: fv('dns_ms'), extra: fv('extra_ms')
+      lan: fv('lan_ms'), wan: fv('wan_ms'), dns: fv('dns_ms'), extra: fv('extra_ms'),
+      down: fv('down_mbps'), up: fv('up_mbps'), score: fv('score')
     });
   }
   if (!samples.length) throw new Error('no usable samples (is this a netlog CSV?)');
@@ -272,8 +275,10 @@ function csvToLog(name, text) {
   const dm = /^\d{4}-\d{2}-\d{2}/.exec(s0.iso);
   const withTarget = samples.find(s => s.extraTarget);
   const spanDays = samples[samples.length - 1].epoch - s0.epoch >= 86399;
+  const hasRate = samples.some(s => s.down != null);
+  const hasScore = samples.some(s => s.score != null);
   return {
-    name, date: dm ? dm[0] : '', sod0, t0: s0.epoch, spanDays,
+    name, date: dm ? dm[0] : '', sod0, t0: s0.epoch, spanDays, hasRate, hasScore,
     gateway: s0.gateway || '\u2014',
     dnsServer: s0.dnsServer || '\u2014',
     extra: (withTarget && withTarget.extraTarget) || 'Custom',
@@ -281,7 +286,10 @@ function csvToLog(name, text) {
     lan: samples.map(s => s.lan),
     wan: samples.map(s => s.wan),
     dns: samples.map(s => s.dns),
-    custom: samples.map(s => s.extra)
+    custom: samples.map(s => s.extra),
+    down: samples.map(s => s.down),
+    up: samples.map(s => s.up),
+    score: samples.map(s => s.score)
   };
 }
 
@@ -297,7 +305,8 @@ let SESSIONS = [];
 // <stats>
 function derive(D) {
   const n = D.dt.length;
-  const S = { wan: D.wan, lan: D.lan, dns: D.dns, custom: D.custom };
+  const S = { wan: D.wan, lan: D.lan, dns: D.dns, custom: D.custom,
+              down: D.down, up: D.up, score: D.score };
   S.beyond = D.wan.map((w, i) => (w == null || D.lan[i] == null) ? null : w - D.lan[i]);
   const jit = new Array(n).fill(null);
   let prev = null;
@@ -328,7 +337,10 @@ function getMETA() {
     dns:    { name: 'DNS',            title: 'DNS latency \u00b7 ' + D.dnsServer, color: 'var(--dns)' },
     custom: { name: D.extra,          title: 'Custom target \u00b7 ' + D.extra,  color: 'var(--custom)' },
     beyond: { name: 'Beyond router',  title: 'Beyond the router (WAN \u2212 LAN)', color: 'var(--beyond)' },
-    jitter: { name: 'Jitter',         title: 'Jitter',                          color: 'var(--jitter)' }
+    jitter: { name: 'Jitter',         title: 'Jitter',                          color: 'var(--jitter)' },
+    down:   { name: 'Down',           title: 'Throughput (green down \u00b7 blue up)', color: 'var(--down)', unit: 'Mbps',
+              overlay: { key: 'up', color: 'var(--up)', name: 'Up' }, noneText: '\u2014', wide: true },
+    up:     { name: 'Up',             title: '',                                color: 'var(--up)', unit: 'Mbps', noneText: '\u2014' }
   };
 }
 
@@ -432,7 +444,10 @@ function linePath(pts) {
   return d;
 }
 
-const ORDER = ['wan', 'lan', 'dns', 'custom', 'beyond', 'jitter'];
+function getORDER() {
+  const base = ['wan', 'lan', 'dns', 'custom', 'beyond', 'jitter'];
+  return D && D.hasRate ? base.concat(['down', 'up']) : base;
+}
 
 /* ---------- tooltip ---------- */
 const tip = $('#tip');
@@ -442,7 +457,7 @@ function buildTip() {
   tip.replaceChildren(tipTime);
   tipRows = {};
   const M = getMETA();
-  for (const k of ORDER) {
+  for (const k of getORDER()) {
     const val = el('span', { class: 'tval' });
     tipRows[k] = val;
     tip.append(el('div', { class: 'trow' },
@@ -451,12 +466,13 @@ function buildTip() {
 }
 function showTip(i, cx, cy) {
   tipTime.textContent = clock(T[i]);
-  for (const k of ORDER) {
+  const M = getMETA();
+  for (const k of getORDER()) {
     const v = SER[k][i], c = tipRows[k];
     if (v == null) {
-      c.textContent = k === 'jitter' ? '\u2014' : '\u2715 no reply';
+      c.textContent = M[k].noneText || (k === 'jitter' ? '\u2014' : '\u2715 no reply');
       c.className = 'tval none';
-    } else { c.textContent = num(v) + ' ms'; c.className = 'tval'; }
+    } else { c.textContent = num(v) + ' ' + (M[k].unit || 'ms'); c.className = 'tval'; }
   }
   tip.hidden = false;
   const w = tip.offsetWidth, h = tip.offsetHeight;
@@ -480,11 +496,12 @@ function makePanel(key, h) {
   const svg = sv('svg', { class: 'plot', role: 'img', tabindex: '0' });
   const wrap = el('div', { class: 'plotwrap' });
   wrap.append(svg);
-  const root = el('figure', { class: 'panel' },
+  const root = el('figure', { class: 'panel' + (m.wide ? ' wide' : '') },
     el('figcaption', { class: 'phead' },
       el('div', { class: 'ptitle' }, el('span', { class: 'key', style: `--c:${m.color}` }), el('span', { text: m.title })), val),
     wrap);
   const P = { key, root, svg, wrap, val, sc: null, avgText: '', hv: null, vl: null, dot: null, kb: null };
+  const unit = m.unit || 'ms';
 
   P.draw = function () {
     const W = Math.max(180, Math.floor(wrap.clientWidth));
@@ -493,9 +510,13 @@ function makePanel(key, h) {
     svg.replaceChildren();
     const ml = 40, mr = 16, mt = 8, mb = 22, pw = W - ml - mr, ph = h - mt - mb;
     const arr = SER[key], { i0, i1 } = state;
+    const oarr = m.overlay ? SER[m.overlay.key] : null;
     const t0 = T[i0]; let t1 = T[i1 - 1]; if (t1 <= t0) t1 = t0 + 1;
     let lo = Infinity, hi = -Infinity;
-    for (let i = i0; i < i1; i++) { const v = arr[i]; if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; } }
+    for (let i = i0; i < i1; i++) {
+      const v = arr[i]; if (v != null) { if (v < lo) lo = v; if (v > hi) hi = v; }
+      if (oarr) { const o = oarr[i]; if (o != null) { if (o < lo) lo = o; if (o > hi) hi = o; } }
+    }
     if (!isFinite(lo)) { lo = 0; hi = 10; }
     const sc = niceScale(key === 'beyond' ? Math.min(0, lo) : 0, hi <= 0 ? 1 : hi * 1.04);
     const X = t => ml + (t - t0) / (t1 - t0) * pw, Y = v => mt + ph - (v - sc.lo) / (sc.hi - sc.lo) * ph;
@@ -515,6 +536,21 @@ function makePanel(key, h) {
       sv('line', { x1: x, x2: x, y1: mt + ph, y2: mt + ph + 3, stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
       const lab = sv('text', { x, y: h - 6, 'text-anchor': 'middle', 'font-size': 10, fill: 'var(--muted)' }, svg);
       lab.textContent = tk.label;
+    }
+
+    // outage bands: runs of 2+ lost WAN probes (latency panels only)
+    if (['wan', 'lan', 'dns', 'custom', 'beyond'].includes(key)) {
+      let runStart = -1;
+      const bands = [];
+      for (let i = i0; i <= i1; i++) {
+        const lost = i < i1 && SER.wan[i] == null;
+        if (lost && runStart < 0) runStart = i;
+        else if (!lost && runStart >= 0) { if (i - runStart >= 2) bands.push([runStart, i - 1]); runStart = -1; }
+      }
+      for (const [a, b] of bands) {
+        sv('rect', { x: X(T[a]), y: mt, width: Math.max(2, X(T[b]) - X(T[a])), height: ph,
+                     fill: 'var(--bad)', 'fill-opacity': 0.13 }, svg);
+      }
     }
 
     // series
@@ -542,6 +578,12 @@ function makePanel(key, h) {
       flush();
       sv('path', { d: band, fill: color, 'fill-opacity': 0.2, stroke: 'none' }, svg);
       sv('path', { d: linePath(mean), fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+      if (oarr) {  // overlay (e.g. upload): bucketed mean line in its own color
+        const osm = new Float64Array(cols), ocn = new Uint16Array(cols);
+        for (let i = i0; i < i1; i++) { const v = oarr[i]; if (v == null) continue; const c = Math.min(cols - 1, Math.floor((T[i] - t0) / (t1 - t0) * (cols - 1))); osm[c] += v; ocn[c]++; }
+        const omean = []; for (let c = 0; c < cols; c++) omean.push(ocn[c] ? [cx(c), Y(osm[c] / ocn[c])] : null);
+        sv('path', { d: linePath(omean), fill: 'none', stroke: m.overlay.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+      }
     } else {
       const pts = [];
       for (let i = i0; i < i1; i++) pts.push(arr[i] == null ? null : [X(T[i]), Y(arr[i])]);
@@ -555,6 +597,11 @@ function makePanel(key, h) {
       for (const p of pts) { if (p) seg.push(p); else area(); }
       area();
       sv('path', { d: linePath(pts), fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+      if (oarr) {
+        const opts = [];
+        for (let i = i0; i < i1; i++) opts.push(oarr[i] == null ? null : [X(T[i]), Y(oarr[i])]);
+        sv('path', { d: linePath(opts), fill: 'none', stroke: m.overlay.color, 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+      }
     }
     // lost probes
     let lostN = 0;
@@ -567,7 +614,7 @@ function makePanel(key, h) {
     }
     // average
     const st = stats(arr, i0, i1);
-    P.avgText = st.avg == null ? '' : `avg ${num(st.avg)} ms`;
+    P.avgText = st.avg == null ? '' : `avg ${num(st.avg)} ${unit}`;
     if (st.avg != null) {
       const ya = Y(st.avg);
       sv('line', { x1: ml, x2: ml + pw, y1: ya, y2: ya, stroke: color, 'stroke-opacity': 0.7, 'stroke-width': 1, 'stroke-dasharray': '4 4' }, svg);
@@ -591,7 +638,7 @@ function makePanel(key, h) {
     };
     hit.addEventListener('pointermove', e => hoverAll(idxAt(e), e.clientX, e.clientY));
     hit.addEventListener('pointerleave', () => hoverAll(null));
-    svg.setAttribute('aria-label', `${m.title}. ${P.avgText ? P.avgText + ', ' : ''}max ${num(st.max)} ms, from ${clock(t0)} to ${clock(t1)}. Use the left and right arrow keys to read values.`);
+    svg.setAttribute('aria-label', `${m.title}. ${P.avgText ? P.avgText + ', ' : ''}max ${num(st.max)} ${unit}, from ${clock(t0)} to ${clock(t1)}. Use the left and right arrow keys to read values.`);
     P.val.textContent = P.avgText;
     P.hover = null;
   };
@@ -605,9 +652,10 @@ function makePanel(key, h) {
     const x = P.sc.X(T[i]), v = SER[key][i];
     P.hv.style.display = '';
     P.vl.setAttribute('x1', x); P.vl.setAttribute('x2', x);
+    const olabel = v == null ? (m.noneText || 'no reply') : `${num(v)} ${unit}`;
     if (v == null) P.dot.style.display = 'none';
     else { P.dot.style.display = ''; P.dot.setAttribute('cx', x); P.dot.setAttribute('cy', P.sc.Y(v)); }
-    P.val.textContent = `${clock(T[i])}  ${v == null ? 'no reply' : num(v) + ' ms'}`;
+    P.val.textContent = `${clock(T[i])}  ${olabel}`;
   };
 
   svg.addEventListener('keydown', e => {
@@ -634,7 +682,10 @@ const grid = $('#grid');
 function buildPanels() {
   grid.replaceChildren();
   panels = [];
-  for (const [k, h] of [['wan', 230], ['custom', 230], ['lan', 230], ['jitter', 190], ['beyond', 190], ['dns', 190]]) grid.append(makePanel(k, h).root);
+  for (const [k, h] of (D.hasRate
+      ? [['wan', 230], ['custom', 230], ['lan', 230], ['jitter', 190], ['beyond', 190], ['dns', 190], ['down', 190]]
+      : [['wan', 230], ['custom', 230], ['lan', 230], ['jitter', 190], ['beyond', 190], ['dns', 190]]))
+    grid.append(makePanel(k, h).root);
 }
 
 /* ---------- overview with brush ---------- */
@@ -756,7 +807,9 @@ function buildCards() {
     { id: 'jitter', label: 'Jitter', color: 'var(--jitter)' },
     { id: 'loss', label: 'Packet loss', color: 'var(--wan)' },
     { id: 'dns', label: 'DNS latency', color: 'var(--dns)' },
-    { id: 'custom', label: 'Custom ' + D.extra, color: 'var(--custom)' }
+    { id: 'custom', label: 'Custom ' + D.extra, color: 'var(--custom)' },
+    { id: 'throughput', label: 'Throughput', color: 'var(--down)' },
+    { id: 'score', label: 'Connection score', color: 'var(--score)' }
   ];
   cardEls = {};
   const host = $('#cards');
@@ -783,7 +836,21 @@ function updateCards() {
   one('lan', 'lan'); one('wan', 'wan'); one('jitter', 'jitter'); one('dns', 'dns', true); one('custom', 'custom');
   const w = stats(SER.wan, i0, i1), total = i1 - i0;
   setCard('loss', (100 * w.lost / total).toFixed(1), '%', `${w.lost} of ${fmtInt(total)} WAN probes lost`);
+  if (D.hasRate) {
+    const ds = stats(SER.down, i0, i1), us = stats(SER.up, i0, i1);
+    setCard('throughput', num(ds.avg), ' Mbps avg', `up ${num(us.avg)} \u00b7 max ${num(ds.max)}`);
+  } else {
+    setCard('throughput', '\u2014', '', 'no throughput data in this log');
+  }
+  if (D.hasScore) {
+    const sc = stats(SER.score, i0, i1);
+    if (sc.n) setCard('score', sc.avg.toFixed(0), ' /100 avg', `grade ${grade(sc.avg)} \u00b7 p95 ${sc.p95.toFixed(0)}`);
+    else setCard('score', '\u2014', '', 'no score data in this log');
+  } else {
+    setCard('score', '\u2014', '', 'no score data in this log');
+  }
 }
+function grade(s) { return s >= 90 ? 'A+' : s >= 80 ? 'A' : s >= 65 ? 'B' : s >= 50 ? 'C' : s >= 35 ? 'D' : 'F'; }
 
 /* ---------- header ---------- */
 function fillHeader() {

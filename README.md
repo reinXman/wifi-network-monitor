@@ -104,9 +104,13 @@ score per series.
 Or open `LogViewer.html` in a browser: drag one or more `netlog_*.csv` files onto
 it (or click to browse) and it renders the full dashboard — charts, stat
 cards, zoomable range strip, table view, derived event log — entirely
-client-side; the file never leaves the machine. Multiple files become a
-session list you can switch between. Sessions that span midnight show
-absolute dates ("Thu 24 Oct 14:03") instead of wrapping clock times.
+client-side; the file never leaves the machine. Newer logs also get a
+full-width throughput panel (down + up), a connection-score card, and red
+outage bands on the latency charts wherever WAN probes went unanswered for
+2+ samples in a row. Multiple files become a session list you can switch
+between. Sessions that span midnight show absolute dates ("Thu 24 Oct
+14:03") instead of wrapping clock times. Old CSVs (before the score and
+throughput columns) still load — those panels/cards just show no data.
 
 ## How it works
 
