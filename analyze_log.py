@@ -55,6 +55,7 @@ def load(paths):
                             "signal": int(float(r["signal_pct"])) if r.get("signal_pct") else None,
                             "extra": float(r["extra_ms"]) if r.get("extra_ms") else None,
                             "load": (r.get("load") or "").strip() == "1",
+                            "score": float(r["score"]) if r.get("score") else None,
                         })
                     except (KeyError, ValueError):
                         continue  # tolerate truncated/partial lines
@@ -107,6 +108,9 @@ def report(rows):
     j = jitter(rows)
     if j is not None:
         print(f"Jitter  : avg {j:.1f} ms")
+    scores = [r["score"] for r in rows if r.get("score") is not None]
+    if scores:
+        print(f"Score   : avg {statistics.fmean(scores):.0f} / 100 over {len(scores)} scored samples")
     loaded = [r for r in rows if r.get("load")]
     idle = [r for r in rows if not r.get("load")]
     if loaded:

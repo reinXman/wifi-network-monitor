@@ -25,6 +25,15 @@ The point of the LAN/WAN split is telling you *where* a problem is:
   DDNS/DHCP changes are picked up.
 - **Jitter** — mean |Δ| between consecutive WAN samples
 - **Packet loss** — failed WAN probes, per session
+- **Percentiles** — p50 / p95 / p99 for LAN and WAN latency (under the
+  latency cards)
+- **Connection score** — ISP-style 0–100 quality score blending latency
+  (40%), jitter (30%) and packet loss (30%), with a letter grade. Also
+  written to the CSV logs as a `score` column.
+- **MTU probe** — a do-not-fragment ping sweep that binary-searches the
+  path MTU and checks whether PMTUD works (router sends "fragmentation
+  needed") or oversized packets are silently blackholed. Button in the
+  bottom bar, or `--mtu [host]` on the CLI.
 - **DNS latency** — a real A-record query over raw UDP to your system DNS
   (or a server of your choice — set it in the top bar or with `--dns-server`)
 - **Load testing** — fill any path on demand: a built-in mini-iperf
@@ -53,18 +62,20 @@ Flags:
 --wan 9.9.9.9         WAN probe host (IP or hostname)
 --extra 10.0.0.2      custom probe target (IP or hostname)
 --dns-server auto     DNS probe server ('auto' = system DNS, the default)
+--mtu [host]          path-MTU / PMTUD probe (default: the gateway), then exit
 --no-gui              headless mode, prints 5 s of stats and exits
 ```
 
 ## Logging
 
 Toggle **Logging** in the bottom bar. One CSV row per probe interval, written
-next to the script (`logs/netlog_YYYYMMDD_HHMMSS.csv`), or
-`~/NetworkMonitorLogs` if that directory can't be created:
+next to the script — one file per day (`logs/netlog_YYYYMMDD.csv`, appended
+to across restarts, rolled over at midnight), or `~/NetworkMonitorLogs` if
+that directory can't be created:
 
 ```csv
-time_iso,epoch,gateway,lan_ms,wan_ms,dns_ms,dns_server,signal_pct,extra_ms,extra_target
-2026-10-16 23:06:01,1792206361.986,10.0.0.1,,60.0,28.6,192.168.0.249,,12.4,
+time_iso,epoch,gateway,lan_ms,wan_ms,dns_ms,dns_server,signal_pct,extra_ms,extra_target,load,score
+2026-10-16 23:06:01,1792206361.986,10.0.0.1,,60.0,28.6,192.168.0.249,,12.4,,1,87.2
 ```
 
 Blank cells are real failures — DNS is probed every tick, so a blank there
@@ -79,13 +90,15 @@ python analyze_log.py logs/netlog_*.csv   # specific files
 python analyze_log.py --plot report.png   # + charts (needs matplotlib)
 ```
 
-Prints min/avg/p50/p95/max, loss %, uptime % and jitter per series.
+Prints min/avg/p50/p95/max, loss %, uptime %, jitter and average connection
+score per series.
 
 Or open `LogViewer.html` in a browser: drag one or more `netlog_*.csv` files onto
 it (or click to browse) and it renders the full dashboard — charts, stat
 cards, zoomable range strip, table view, derived event log — entirely
 client-side; the file never leaves the machine. Multiple files become a
-session list you can switch between.
+session list you can switch between. Sessions that span midnight show
+absolute dates ("Thu 24 Oct 14:03") instead of wrapping clock times.
 
 ## How it works
 

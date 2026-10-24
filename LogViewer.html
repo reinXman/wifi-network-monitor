@@ -271,8 +271,9 @@ function csvToLog(name, text) {
              + (s0.epoch - Math.floor(s0.epoch));
   const dm = /^\d{4}-\d{2}-\d{2}/.exec(s0.iso);
   const withTarget = samples.find(s => s.extraTarget);
+  const spanDays = samples[samples.length - 1].epoch - s0.epoch >= 86399;
   return {
-    name, date: dm ? dm[0] : '', sod0, t0: s0.epoch,
+    name, date: dm ? dm[0] : '', sod0, t0: s0.epoch, spanDays,
     gateway: s0.gateway || '\u2014',
     dnsServer: s0.dnsServer || '\u2014',
     extra: (withTarget && withTarget.extraTarget) || 'Custom',
@@ -355,9 +356,21 @@ function fmtSod(sod, withSec = true) {
   const hh = Math.floor(sod / 3600) % 24, mm = Math.floor(sod / 60) % 60, ss = sod % 60;
   return withSec ? `${p2(hh)}:${p2(mm)}:${p2(ss)}` : `${p2(hh)}:${p2(mm)}`;
 }
+// for sessions that span midnight/multiple days: absolute 'Thu 24 Oct 14:03' style label
+// (day 0 is D.date, from the first sample's time_iso)
+function dayClock(sod, withSec = true) {
+  if (!D.date) return fmtSod(sod, withSec);
+  const day = Math.floor(sod / 86400);
+  const [y, m, d] = D.date.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + day));
+  return `${DAYS[dt.getUTCDay()]} ${dt.getUTCDate()} ${MONTHS[dt.getUTCMonth()]} ${fmtSod(sod - day * 86400, withSec)}`;
+}
 // the app writes epoch rounded to the millisecond, so a sample at 19.9996 s is stored as .000 of the next second
 // while its text time stays at 19; the small offset keeps the page's clock identical to the CSV's time column
-function clock(t, withSec = true) { return fmtSod(Math.floor(D.sod0 + t - 0.0005), withSec); }
+function clock(t, withSec = true) {
+  const sod = D.sod0 + t - 0.0005;
+  return D.spanDays ? dayClock(sod, withSec) : fmtSod(Math.floor(sod), withSec);
+}
 function dur(sec) {
   sec = Math.round(sec);
   const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
@@ -396,9 +409,16 @@ function niceScale(lo, hi, target = 4) {
   return { lo: nlo, hi: nhi, ticks };
 }
 function timeTicks(t0, t1, maxTicks = 7) {
-  const span = t1 - t0, steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+  const span = t1 - t0, out = [];
+  if (D.spanDays) {
+    const steps = [21600, 43200, 86400, 172800, 3 * 86400, 7 * 86400];
+    const st = steps.find(s => span / s <= maxTicks) || 7 * 86400;
+    for (let k = Math.ceil((D.sod0 + t0) / st); k * st - D.sod0 <= t1 + 1e-6; k++)
+      out.push({ t: k * st - D.sod0, label: dayClock(k * st, st < 86400) });
+    return out;
+  }
+  const steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
   const st = steps.find(s => span / s <= maxTicks) || 3600;
-  const out = [];
   for (let k = Math.ceil((D.sod0 + t0) / st); k * st - D.sod0 <= t1 + 1e-6; k++) out.push({ t: k * st - D.sod0, label: fmtSod(k * st, st < 60) });
   return out;
 }
@@ -856,7 +876,7 @@ function renderTable() {
   for (const [b, idx] of buckets) {
     const L = agg(idx, SER.lan), W = agg(idx, SER.wan), C = agg(idx, SER.custom), Dn = agg(idx, SER.dns), B = agg(idx, SER.beyond);
     const lost = L.lost + W.lost + C.lost + Dn.lost;
-    const label = fmtSod(b * bs, bs < 60);
+    const label = D.spanDays ? dayClock(b * bs, false) : fmtSod(b * bs, bs < 60);
     const tr = el('tr');
     for (const c of [label, num(L.avg), num(L.max), num(W.avg), num(W.max), num(C.avg), num(Dn.avg), num(Dn.max), num(B.avg), lost ? String(lost) : '0']) tr.append(el('td', { text: c }));
     tb.append(tr);

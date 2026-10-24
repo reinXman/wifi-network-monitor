@@ -9,9 +9,14 @@ What it monitors:
   * WAN latency   — ICMP pings to an internet host (default 1.1.1.1)
   * Jitter        — variation in WAN latency over the window
   * Packet loss   — failed probes (per-window and per-session)
+  * Percentiles   — p50 / p95 / p99 WAN and LAN latency
+  * Score         — ISP-style 0-100 connection quality score (latency +
+                    jitter + loss blend)
   * DNS latency   — real raw-UDP DNS query round-trip time
   * WiFi details  — SSID, signal %, channel, link speed (needs elevation
                     or Location permission on Windows 11; degrades gracefully)
+  * Path MTU      — DF-flagged fragmentation probe + PMTUD blackhole check
+                    (--mtu HOST, or the 'MTU probe' button)
 
 Separating LAN from WAN tells you WHERE the problem is:
     LAN ok  + WAN ok   ->  ONLINE
@@ -23,6 +28,8 @@ Usage:
   python network_monitor.py --interval 2    # probe every 2 s
   python network_monitor.py --wan 9.9.9.9   # different WAN probe host
   python network_monitor.py --no-gui        # headless diagnostic mode (5 s)
+  python network_monitor.py --mtu           # path-MTU / PMTUD probe to gateway
+  python network_monitor.py --mtu 9.9.9.9   # path-MTU probe to a specific host
 """
 
 import argparse
@@ -39,6 +46,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import tkinter.messagebox as messagebox
 from collections import deque, namedtuple
 
 # ---------------------------------------------------------------------------
@@ -55,12 +63,18 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 if IS_WINDOWS:
     _icmp = ctypes.windll.iphlpapi
+    _kernel32 = ctypes.windll.kernel32
     _icmp.IcmpCreateFile.restype = ctypes.c_void_p
     _icmp.IcmpSendEcho.argtypes = [
         ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint16,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
     ]
     _icmp.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+
+    class _IP_OPTION_INFORMATION(ctypes.Structure):
+        _fields_ = [("Ttl", ctypes.c_ubyte), ("Tos", ctypes.c_ubyte),
+                    ("Flags", ctypes.c_ubyte), ("OptionsSize", ctypes.c_ubyte),
+                    ("OptionsData", ctypes.c_void_p)]
 
     class _ICMP_ECHO_REPLY(ctypes.Structure):
         _fields_ = [("Address", ctypes.c_uint32), ("Status", ctypes.c_uint32),
@@ -69,34 +83,60 @@ if IS_WINDOWS:
                     ("Options", ctypes.c_void_p)]
 
 
-def icmp_ping(ip_str: str, timeout_ms: int = 1500, payload: bytes = b"network-monitor-32-byte-payload!") -> float | None:
-    """Send one ICMP echo, return RTT in ms, or None on failure/timeout."""
+DEFAULT_PAYLOAD = b"network-monitor-32-byte-payload!"
+
+# Windows ICMP status codes we care about (iphlpapi's IP_STATUS enum):
+IP_PACKET_TOO_BIG = 11009  # a router sent back ICMP "fragmentation needed"
+IP_REQ_TIMED_OUT = 11010   # silent drop — with DF set, smells like a PMTUD blackhole
+
+
+def icmp_probe(ip_str: str, timeout_ms: int = 1500,
+               payload: bytes = DEFAULT_PAYLOAD, df: bool = False) -> tuple[float | None, int | None]:
+    """Send one ICMP echo. Returns (rtt_ms_or_None, status).
+
+    status is the Windows IP_STATUS code (0 = success, 11009 = packet too
+    big, 11010 = timed out, ...), -1 when no reply structure was available
+    (send failure / POSIX path), or None on any local error.
+    """
     if not IS_WINDOWS:
         try:
             out = subprocess.run(
                 ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), ip_str],
                 capture_output=True, text=True, timeout=timeout_ms / 1000 + 1)
             m = re.search(r"time[=<]\s*([\d.]+)\s*ms", out.stdout, re.I)
-            return float(m.group(1)) if m else None
+            return (float(m.group(1)) if m else None), -1
         except Exception:
-            return None
+            return None, -1
     h = _icmp.IcmpCreateFile()
     try:
         dest = struct.unpack("<I", socket.inet_aton(ip_str))[0]
-        buf = ctypes.create_string_buffer(1024)
         data = ctypes.create_string_buffer(payload, len(payload))
+        buf = ctypes.create_string_buffer(len(payload) + 512)
+        opts = None
+        if df:  # IP_FLAG_DF: do-not-fragment — used by the path-MTU probe
+            opts = ctypes.pointer(_IP_OPTION_INFORMATION(
+                Ttl=128, Tos=0, Flags=0x2, OptionsSize=0, OptionsData=None))
         n = _icmp.IcmpSendEcho(ctypes.c_void_p(h), dest, data, len(payload),
-                               None, buf, 1024, timeout_ms)
+                               opts if opts else None,
+                               buf, len(buf), timeout_ms)
         if not n:
-            return None
+            # no reply structure; GetLastError carries the ICMP status
+            return None, _kernel32.GetLastError()
         reply = ctypes.cast(buf, ctypes.POINTER(_ICMP_ECHO_REPLY)).contents
         if reply.Status != 0:  # 0 == IP_SUCCESS
-            return None
-        return float(reply.RoundTripTime)
+            return None, reply.Status
+        return float(reply.RoundTripTime), 0
     except Exception:
-        return None
+        return None, None
     finally:
         _icmp.IcmpCloseHandle(ctypes.c_void_p(h))
+
+
+def icmp_ping(ip_str: str, timeout_ms: int = 1500,
+              payload: bytes = DEFAULT_PAYLOAD) -> float | None:
+    """Send one ICMP echo, return RTT in ms, or None on failure/timeout."""
+    rtt, _ = icmp_probe(ip_str, timeout_ms, payload)
+    return rtt
 
 
 def resolve_host(host: str) -> str | None:
@@ -121,6 +161,95 @@ def tcp_probe(ip: str, port: int = 443, timeout: float = 1.5) -> float | None:
         return None
     finally:
         s.close()
+
+
+def pctl(vals, q: float):
+    """Nearest-rank percentile (q in 0..1) of a non-empty sequence."""
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(len(s) * q))]
+
+
+def connection_score(p50_ms: float, jitter_ms: float, loss_pct: float):
+    """ISP-style connection quality score, 0-100.
+
+    Blends three sub-scores (each 0-100, higher is better):
+      latency  40% — p50 WAN RTT   (great ≈0-20 ms, poor ≈150+ ms)
+      jitter   30% — mean |Δ| of consecutive WAN RTTs
+      loss     30% — failed-probe percentage in the window
+    Returns (total, latency_sub, jitter_sub, loss_sub).
+    """
+    lat = 100.0 / (1.0 + (max(0.0, p50_ms) / 70.0) ** 1.5)
+    jit = 100.0 / (1.0 + (max(0.0, jitter_ms) / 30.0) ** 1.5)
+    los = max(0.0, min(100.0, 100.0 * (1.0 - loss_pct / 10.0)))
+    return 0.40 * lat + 0.30 * jit + 0.30 * los, lat, jit, los
+
+
+def score_grade(score: float) -> tuple[str, str]:
+    """Map a 0-100 score to a (letter grade, theme color)."""
+    if score >= 90: return "A+", GREEN
+    if score >= 80: return "A", GREEN
+    if score >= 65: return "B", GREEN
+    if score >= 50: return "C", YELLOW
+    if score >= 35: return "D", YELLOW
+    return "F", RED
+
+
+def mtu_probe(ip: str, timeout_ms: int = 1000, max_payload: int = 1472) -> dict:
+    """Path-MTU probe: RFC-1191-style search with do-not-fragment pings.
+
+    Sends unfragmentable (DF) echo requests and binary-searches the largest
+    payload that survives; payload + 28 bytes of IP+ICMP header = the
+    reported path MTU. Also detects whether the path practices PMTUD
+    (routers send back 'fragmentation needed') or silently blackholes
+    oversized packets.
+
+    Returns {ip, reachable, [mtu, exact, too_big, timeout]}.
+    """
+    def df_ok(size: int) -> tuple[bool, int | None]:
+        if IS_WINDOWS:
+            rtt, st = icmp_probe(ip, timeout_ms, b"x" * size, df=True)
+            return rtt is not None, st
+        cmd = ["ping", "-c", "1", "-s", str(size)]
+        cmd += (["-D"] if sys.platform == "darwin" else ["-M", "do"]) + [ip]
+        try:
+            ok = subprocess.run(cmd, capture_output=True,
+                                timeout=timeout_ms / 1000 + 1,
+                                creationflags=NO_WINDOW).returncode == 0
+            return ok, -1
+        except Exception:
+            return False, -1
+
+    ok, st = df_ok(64)  # tiny DF ping: reachability baseline
+    if not ok:
+        return {"ip": ip, "reachable": False, "status": st}
+    res = {"ip": ip, "reachable": True, "too_big": False, "timeout": False}
+
+    if df_ok(max_payload)[0]:
+        # even the usual Ethernet cap passes — bound it higher (jumbo LANs)
+        mtu = max_payload + 28
+        for size in (3972, 8972):
+            ok, st = df_ok(size)
+            if ok:
+                mtu = size + 28
+            else:
+                if st == IP_PACKET_TOO_BIG: res["too_big"] = True
+                elif st == IP_REQ_TIMED_OUT: res["timeout"] = True
+                break
+        res["mtu"], res["exact"] = mtu, mtu <= max_payload + 28
+        return res
+
+    lo, hi = 64, max_payload  # lo known-good, hi known-bad
+    while hi - lo > 8:
+        mid = (lo + hi) // 2
+        ok, st = df_ok(mid)
+        if ok:
+            lo = mid
+        else:
+            hi = mid
+            if st == IP_PACKET_TOO_BIG: res["too_big"] = True
+            elif st == IP_REQ_TIMED_OUT: res["timeout"] = True
+    res["mtu"], res["exact"] = lo + 28, True
+    return res
 
 
 # ---- Load testing: a mini-iperf in pure stdlib, plus a rude UDP blaster ----
@@ -586,6 +715,9 @@ def query_wifi() -> dict | None:
 Sample = namedtuple("Sample", "t v")
 
 
+MAX_LOG_BYTES = 64 * 1024 * 1024  # roll a day's log file if it grows past this
+
+
 class State:
     def __init__(self, window: int):
         self.lock = threading.Lock()
@@ -609,6 +741,7 @@ class State:
                        "extra_sent": 0, "extra_recv": 0}
         self._lan_ok = self._wan_ok = self._extra_ok = None
         self._signal_warned = False
+        self.last_score = None  # latest connection score (set by the GUI refresh)
 
     def add_event(self, msg: str, kind: str = "info"):
         self.events.append(Sample(time.strftime("%H:%M:%S"), (msg, kind)))
@@ -655,10 +788,12 @@ class Collector(threading.Thread):
         self._wan_ip = None    # resolved IPv4 for the WAN target
         self._extra_ip = None  # resolved IPv4 for the custom target
         self._last_tcp_check = 0.0
-        # CSV logging
+        # CSV logging (one file per day; rolls at midnight or 64 MB)
         self.log_flag = threading.Event()
         self.log_file = None
         self.log_path = None
+        self._log_date = None
+        self._log_rows = 0
         self._last_dns = None
         self._last_signal = None
 
@@ -827,24 +962,42 @@ class Collector(threading.Thread):
                 continue
         raise OSError("could not create a writable logs directory")
 
+    # One row per probe; the trailing 'score' column is the connection score.
+    LOG_HEADER = ["time_iso", "epoch", "gateway", "lan_ms", "wan_ms", "dns_ms",
+                  "dns_server", "signal_pct", "extra_ms", "extra_target", "load",
+                  "score"]
+
     def start_logging(self, logs_dir: str | None = None) -> str | None:
-        """Open a timestamped CSV file and begin writing one row per probe."""
+        """Open today's CSV file (one per day) and begin writing one row per probe."""
         try:
-            logs_dir = logs_dir or self._logs_dir()
-            path = os.path.join(logs_dir, time.strftime("netlog_%Y%m%d_%H%M%S.csv"))
-            f = open(path, "a", newline="", encoding="utf-8")
-            csv.writer(f).writerow(["time_iso", "epoch", "gateway",
-                                    "lan_ms", "wan_ms", "dns_ms",
-                                    "dns_server", "signal_pct",
-                                    "extra_ms", "extra_target", "load"])
-            f.flush()
-            self.log_file = f
-            self.log_path = path
+            path = self._open_daily(logs_dir)
             self.log_flag.set()
             return path
         except OSError as e:
             self.state.add_event(f"Logging failed to start: {e}", "bad")
             return None
+
+    def _open_daily(self, logs_dir: str | None = None) -> str:
+        """Open netlog_YYYYMMDD.csv (appending across restarts); header only if new.
+        Rolls to a _1/_2… suffix if a single day ever exceeds MAX_LOG_BYTES."""
+        logs_dir = logs_dir or self._logs_dir()
+        date = time.strftime("%Y%m%d")
+        n = 0
+        while True:
+            suffix = "" if n == 0 else f"_{n}"
+            path = os.path.join(logs_dir, f"netlog_{date}{suffix}.csv")
+            if not (os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES):
+                break
+            n += 1
+        new = not os.path.exists(path) or os.path.getsize(path) == 0
+        f = open(path, "a", newline="", encoding="utf-8")
+        if new:
+            csv.writer(f).writerow(self.LOG_HEADER)
+        f.flush()
+        self.log_file = f
+        self.log_path = path
+        self._log_date = date
+        return path
 
     def stop_logging(self):
         self.log_flag.clear()
@@ -864,8 +1017,18 @@ class Collector(threading.Thread):
             return
         try:
             st = self.state
+            # roll to a new file at midnight (or if the day's file gets huge)
+            today = time.strftime("%Y%m%d")
+            self._log_rows += 1
+            if today != self._log_date or (self._log_rows % 120 == 0 and
+                                           os.path.getsize(self.log_path) > MAX_LOG_BYTES):
+                self.log_file.close()
+                self._open_daily()
+                self._log_rows = 0
+                st.add_event(f"Log rolled over to {os.path.basename(self.log_path)}")
             with st.lock:
                 load_active = st.load_active
+                score = st.last_score
             csv.writer(self.log_file).writerow([
                 time.strftime("%Y-%m-%d %H:%M:%S"), f"{time.time():.3f}",
                 st.gateway or "", self._fmt(lan_rtt), self._fmt(wan_rtt),
@@ -873,6 +1036,7 @@ class Collector(threading.Thread):
                 st.dns_server or "", self._fmt(self._last_signal),
                 self._fmt(extra_rtt), st.extra_host or "",
                 "1" if load_active else "",
+                f"{score:.1f}" if score is not None else "",
             ])
             self.log_file.flush()
         except Exception:
@@ -1215,10 +1379,12 @@ class Dashboard(tk.Tk):
         for col, (key, title, color) in enumerate([
                 ("lan", "LAN LATENCY", CYAN), ("wan", "WAN LATENCY", GREEN),
                 ("jitter", "JITTER", YELLOW), ("loss", "PACKET LOSS", RED),
-                ("signal", "WIFI SIGNAL", BLUE), ("dns", "DNS LATENCY", PURPLE)]):
+                ("score", "CONNECTION SCORE", ROSE), ("signal", "WIFI SIGNAL", BLUE),
+                ("dns", "DNS LATENCY", PURPLE)]):
             self.cards[key] = self._card(row, col, title, color)
         self.cards["signal"][0].config(fg=BLUE)
         self.cards["loss"][0].config(fg=GREEN)
+        self.cards["score"][0].config(fg=ROSE)
 
     # ---- graphs + log ----
 
@@ -1260,6 +1426,9 @@ class Dashboard(tk.Tk):
                                    relief="flat", font=self.fonts["small"], padx=12)
         self.pause_btn.pack(side="right", padx=4)
         tk.Button(bar, text="Load test", command=self._open_load_dialog, bg=CARD,
+                  fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
+                  relief="flat", font=self.fonts["small"], padx=12).pack(side="right")
+        tk.Button(bar, text="MTU probe", command=self._run_mtu_probe, bg=CARD,
                   fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
                   relief="flat", font=self.fonts["small"], padx=12).pack(side="right")
         tk.Button(bar, text="Reset stats", command=self._reset_stats, bg=CARD, fg=TEXT,
@@ -1309,6 +1478,47 @@ class Dashboard(tk.Tk):
                                  "lan_recv": 0, "extra_sent": 0, "extra_recv": 0}
             self.state.start_time = time.time()
         self.state.add_event("Statistics reset")
+
+    def _run_mtu_probe(self):
+        """DF-ping the gateway + WAN target in a worker thread, show path MTU."""
+        self.state.add_event("MTU probe started (gateway + WAN target)…")
+
+        def work():
+            targets = []
+            if self.state.gateway:
+                targets.append(("Gateway", self.state.gateway))
+            wan_ip = self.collector._wan_ip or resolve_host(self.collector.wan_host)
+            if wan_ip:
+                targets.append((f"WAN ({self.collector.wan_host})", wan_ip))
+            results = [(lab, ip, mtu_probe(ip)) for lab, ip in targets]
+
+            def fmt(label, ip, r):
+                if not r.get("reachable"):
+                    return f"{label} {ip}\n  no reply — host unreachable"
+                mtu, exact = r["mtu"], r.get("exact")
+                lines = [f"{label} {ip}",
+                         f"  path MTU: {mtu} bytes ({mtu - 28} byte payload)"
+                         + ("" if exact else " or higher")]
+                if r.get("too_big"):
+                    lines.append("  PMTUD: working — router returned 'fragmentation needed'")
+                elif r.get("timeout") and exact and mtu < 1500:
+                    lines.append("  PMTUD: WARNING — oversized packets silently dropped "
+                                 "(classic PMTUD blackhole; large transfers may stall)")
+                return "\n".join(lines)
+
+            text = "\n\n".join(fmt(*t) for t in results) if results else \
+                "No targets available (no gateway, WAN unresolved)."
+            summary = " · ".join(
+                f"{lab} {r['mtu']}" if r.get("reachable") else f"{lab} unreachable"
+                for lab, _ip, r in results)
+
+            def done():
+                self.state.add_event(f"MTU probe: {summary}",
+                                     "info" if results else "warn")
+                messagebox.showinfo("MTU / path-MTU probe", text, parent=self)
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ---- load test ----
 
@@ -1500,11 +1710,14 @@ class Dashboard(tk.Tk):
             if color:
                 v.config(fg=color)
 
+        def pct_sub(vals):
+            return f"p50 {pctl(vals, .5):.0f} · p95 {pctl(vals, .95):.0f} · p99 {pctl(vals, .99):.0f} ms"
+
         set_card("lan", f"{lan_v[-1]:.1f} ms" if lan_v else "—",
-                 f"min {min(lan_v):.0f} · max {max(lan_v):.0f} ms" if lan_v else "no reply",
+                 pct_sub(lan_v) if lan_v else "no reply",
                  color=None if lan_v else RED)
         set_card("wan", f"{wan_v[-1]:.1f} ms" if wan_v else "—",
-                 f"min {min(wan_v):.0f} · max {max(wan_v):.0f} ms" if wan_v else "no reply")
+                 pct_sub(wan_v) if wan_v else "no reply")
         set_card("jitter", f"{jitter:.1f} ms" if jitter is not None else "—",
                  "mean |Δ| consecutive")
         loss_color = GREEN if loss_pct < 2 else (YELLOW if loss_pct < 10 else RED)
@@ -1512,9 +1725,22 @@ class Dashboard(tk.Tk):
                  f"{counts['wan_sent'] - counts['wan_recv']} of {counts['wan_sent']} lost",
                  color=loss_color)
 
+        # --- connection score: 0-100 blend of latency, jitter, loss ---
+        if wan_v:
+            score, s_lat, s_jit, s_los = connection_score(
+                pctl(wan_v, .5), jitter if jitter is not None else 0.0, loss_pct)
+            st.last_score = score
+            letter, scolor = score_grade(score)
+            set_card("score", f"{score:.0f}",
+                     f"{letter} · lat {s_lat:.0f} jit {s_jit:.0f} loss {s_los:.0f}",
+                     color=scolor)
+        else:
+            st.last_score = None
+            set_card("score", "0", "offline", color=RED)
+
         if sig and sig[-1].v is not None:
-            extra = (wifi.get("channel") or wifi.get("band") or "") if wifi else ""
-            set_card("signal", f"{sig[-1].v:.0f} %", extra or "signal quality", color=BLUE)
+            wifi_sub = (wifi.get("channel") or wifi.get("band") or "") if wifi else ""
+            set_card("signal", f"{sig[-1].v:.0f} %", wifi_sub or "signal quality", color=BLUE)
         else:
             set_card("signal", "—",
                      "needs admin rights" if wifi_avail is False and IS_WINDOWS
@@ -1602,6 +1828,29 @@ class Dashboard(tk.Tk):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def cli_mtu_probe(host: str, timeout_ms: int = 1000) -> None:
+    """CLI path-MTU probe; prints results (only runs outside the GUI)."""
+    ip = resolve_host(host)
+    if not ip:
+        print(f"cannot resolve {host!r}")
+        return
+    r = mtu_probe(ip)
+    print(f"path-MTU probe to {host} ({ip}):")
+    if not r.get("reachable"):
+        print("  no reply — host unreachable")
+        return
+    mtu, exact = r["mtu"], r.get("exact")
+    print(f"  path MTU: {mtu} bytes ({mtu - 28} byte payload)"
+          + ("" if exact else " or higher"))
+    if r.get("too_big"):
+        print("  PMTUD: working — router returned 'fragmentation needed'")
+    elif r.get("timeout") and exact and mtu < 1500:
+        print("  PMTUD: WARNING — oversized packets silently dropped "
+              "(classic PMTUD blackhole; large transfers may stall)")
+    else:
+        print("  PMTUD: no problems detected")
+
+
 def headless(state: State, collector: Collector, seconds: float = 5.0):
     collector.start()
     time.sleep(seconds)
@@ -1611,8 +1860,11 @@ def headless(state: State, collector: Collector, seconds: float = 5.0):
     with state.lock:
         for name, deq in series:
             vals = [s.v for s in deq if s.v is not None]
-            print(f"{name}: {len(deq)} samples, {len(vals)} ok"
-                  + (f", avg {statistics.fmean(vals):.1f} ms" if vals else ""))
+            extra = ""
+            if vals:
+                extra = f", avg {statistics.fmean(vals):.1f}" \
+                        f", p50 {pctl(vals, .5):.1f}, p95 {pctl(vals, .95):.1f} ms"
+            print(f"{name}: {len(deq)} samples, {len(vals)} ok{extra}")
         print("gateway:", state.gateway, "| wifi:", state.wifi)
         for e in state.events:
             print(f"  [{e.t}] {e.v[0]}")
@@ -1649,7 +1901,14 @@ def main():
                     help="with --load-test: rude UDP blast (no peer needed)")
     ap.add_argument("--rude-port", type=int, default=9,
                     help="rude mode target port (default 9 = discard)")
+    ap.add_argument("--mtu", metavar="HOST", nargs="?", const="", default=None,
+                    help="path-MTU / PMTUD probe to HOST (default: the gateway); "
+                         "probes and exits")
     args = ap.parse_args()
+
+    if args.mtu is not None:
+        cli_mtu_probe(args.mtu or get_default_gateway() or args.wan)
+        return
 
     if args.serve:
         load_server(args.port)
