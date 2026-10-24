@@ -35,6 +35,7 @@ Usage:
 import argparse
 import csv
 import ctypes
+import json
 import os
 import re
 import socket
@@ -70,6 +71,21 @@ if IS_WINDOWS:
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
     ]
     _icmp.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+
+    # Live throughput: GetBestRoute + GetIfEntry2. The counters are read from
+    # a raw buffer at fixed offsets — a hand-written ctypes MIB_IF_ROW2
+    # struct misaligns them (see DEVLOG).
+    _icmp.GetBestRoute.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    _icmp.GetBestRoute.restype = ctypes.c_uint32
+    _icmp.GetIfEntry2.argtypes = [ctypes.c_void_p]
+    _icmp.GetIfEntry2.restype = ctypes.c_uint32
+
+    class _MIB_IPFORWARDROW(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_uint32) for n in (
+            "dwForwardDest", "dwForwardMask", "dwForwardPolicy", "dwForwardNextHop",
+            "dwForwardIfIndex", "dwForwardType", "dwForwardProto", "dwForwardAge",
+            "dwForwardNextHopAS", "dwForwardMetric1", "dwForwardMetric2",
+            "dwForwardMetric3", "dwForwardMetric4", "dwForwardMetric5")]
 
     class _IP_OPTION_INFORMATION(ctypes.Structure):
         _fields_ = [("Ttl", ctypes.c_ubyte), ("Tos", ctypes.c_ubyte),
@@ -250,6 +266,59 @@ def mtu_probe(ip: str, timeout_ms: int = 1000, max_payload: int = 1472) -> dict:
             elif st == IP_REQ_TIMED_OUT: res["timeout"] = True
     res["mtu"], res["exact"] = lo + 28, True
     return res
+
+
+IFROW_BUF = 2048  # > sizeof(MIB_IF_ROW2); counters read at fixed offsets
+IFROW_IN_OCTETS = 1208   # u64 offset in the GetIfEntry2 row buffer (Win11 x64,
+IFROW_OUT_OCTETS = 1280  # ABI-frozen; verified via delta-matching — see DEVLOG)
+IFROW_ALIAS = 28         # c_wchar[257] interface alias
+
+
+def iface_counters(dest_ip: str | None):
+    """Live byte counters for the interface that routes to dest_ip.
+
+    Returns (if_index, in_octets, out_octets, alias) or None. Windows uses
+    GetBestRoute + GetIfEntry2 (raw buffer, fixed offsets — a hand-written
+    MIB_IF_ROW2 struct misaligns, see DEVLOG); POSIX parses /proc/net/dev
+    (summing every non-loopback interface).
+    """
+    if not dest_ip:
+        return None
+    if IS_WINDOWS:
+        if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", dest_ip):
+            dest_ip = resolve_host(dest_ip)
+            if not dest_ip:
+                return None
+        row = _MIB_IPFORWARDROW()
+        if _icmp.GetBestRoute(struct.unpack("<I", socket.inet_aton(dest_ip))[0], 0,
+                              ctypes.byref(row)) != 0:
+            return None
+        idx = row.dwForwardIfIndex
+        if not idx:
+            return None
+        buf = ctypes.create_string_buffer(IFROW_BUF)
+        struct.pack_into("<I", buf, 8, idx)  # InterfaceIndex — all the API needs
+        if _icmp.GetIfEntry2(buf) != 0:
+            return None
+        d = bytes(buf[:IFROW_OUT_OCTETS + 8])
+        alias = d[IFROW_ALIAS:IFROW_ALIAS + 514].decode("utf-16-le", "ignore").split("\x00")[0]
+        return idx, struct.unpack_from("<Q", d, IFROW_IN_OCTETS)[0], \
+            struct.unpack_from("<Q", d, IFROW_OUT_OCTETS)[0], alias
+    # POSIX: /proc/net/dev — bytes are fields 0 (rx) and 8 (tx) per interface
+    try:
+        with open("/proc/net/dev") as f:
+            lines = f.readlines()[2:]
+        inb = outb = 0
+        for ln in lines:
+            name, rest = ln.split(":", 1)
+            if name.strip() == "lo":
+                continue
+            fields = rest.split()
+            inb += int(fields[0])
+            outb += int(fields[8])
+        return 0, inb, outb, ""
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 # ---- Load testing: a mini-iperf in pure stdlib, plus a rude UDP blaster ----
@@ -730,6 +799,13 @@ class State:
         self.events = deque(maxlen=100)
         self.load_spans = deque(maxlen=50)  # [t0, t1|None, label] load-test windows
         self.load_active = False
+        self.wan_outage_spans = deque(maxlen=200)  # [t0, t1|None] — shaded on graphs
+        self.lan_outage_spans = deque(maxlen=200)
+        self.wan_down_since = None  # tick time the current outage began, if any
+        self.lan_down_since = None
+        self.closed_outages = deque(maxlen=200)  # (kind, t0, t1) → outages.jsonl
+        self.rate_down = deque(maxlen=window)  # interface Mbps, sampled per tick
+        self.rate_up = deque(maxlen=window)
         self.wifi = None
         self.gateway = None
         self.wan_host = None
@@ -770,6 +846,31 @@ class State:
                 self.add_event(f"Custom target {extra_label} restored", "good")
         self._lan_ok, self._wan_ok = lan_ok, wan_ok
         self._extra_ok = extra_ok if extra_ok is not None else self._extra_ok
+        # outage windows for graph shading + the persisted outage history
+        now = time.time()
+        with self.lock:
+            self._track_outage(wan_ok, "wan", now)
+            self._track_outage(lan_ok, "lan", now)
+
+    def _track_outage(self, ok: bool, kind: str, now: float):
+        """Open/close an outage span; call under self.lock, once per tick."""
+        spans = self.wan_outage_spans if kind == "wan" else self.lan_outage_spans
+        since = self.wan_down_since if kind == "wan" else self.lan_down_since
+        if not ok:
+            if since is None:
+                if kind == "wan":
+                    self.wan_down_since = now
+                else:
+                    self.lan_down_since = now
+                spans.append([now, None])
+        elif since is not None:
+            if kind == "wan":
+                self.wan_down_since = None
+            else:
+                self.lan_down_since = None
+            if spans and spans[-1][1] is None:
+                spans[-1][1] = now
+            self.closed_outages.append((kind, since, now))
 
 
 class Collector(threading.Thread):
@@ -788,6 +889,9 @@ class Collector(threading.Thread):
         self._wan_ip = None    # resolved IPv4 for the WAN target
         self._extra_ip = None  # resolved IPv4 for the custom target
         self._last_tcp_check = 0.0
+        self._tp = None  # (t, if_index, in_octets, out_octets) baseline for rates
+        self._last_rate = (None, None)  # (down_mbps, up_mbps) for the CSV row
+        self._iface_noted = False
         # CSV logging (one file per day; rolls at midnight or 64 MB)
         self.log_flag = threading.Event()
         self.log_file = None
@@ -902,6 +1006,8 @@ class Collector(threading.Thread):
             st.check_transitions(lan_rtt is not None, wan_rtt is not None,
                                  extra_rtt is not None if self.extra_host else None,
                                  self.extra_host)
+            self._sample_throughput(st)
+            self._flush_outages(st)
 
             # cross-check: when ICMP to WAN fails but LAN is fine, try TCP:443
             # (rate-limited) so ICMP-blocking networks don't read as fully down
@@ -944,6 +1050,78 @@ class Collector(threading.Thread):
             elapsed = time.perf_counter() - t0
             self.stop_flag.wait(max(0.05, self.interval - elapsed))
 
+    # ---- live throughput (interface byte counters) ----
+
+    def _sample_throughput(self, st: State) -> None:
+        """Update st.rate_down / st.rate_up (Mbps) from interface counters."""
+        now = time.time()
+        res = iface_counters(self._wan_ip or st.gateway)
+        if res is None:
+            self._tp = None
+            self._last_rate = (None, None)
+            st.record(st.rate_down, None)
+            st.record(st.rate_up, None)
+            return
+        idx, inb, outb, alias = res
+        prev = self._tp
+        self._tp = (now, idx, inb, outb)
+        down = up = None
+        if prev and prev[1] == idx and inb >= prev[2] and outb >= prev[3]:
+            dt = now - prev[0]
+            # skip huge gaps (pause/resume) and counter resets (adapter bounce)
+            if 0.05 < dt < max(5.0, self.interval * 5):
+                down = (inb - prev[2]) * 8.0 / dt / 1e6
+                up = (outb - prev[3]) * 8.0 / dt / 1e6
+        st.record(st.rate_down, down)
+        st.record(st.rate_up, up)
+        self._last_rate = (down, up)
+        if alias and down is not None and not self._iface_noted:
+            self._iface_noted = True
+            st.add_event(f"Throughput monitoring on {alias}", "info")
+
+    # ---- outage history (outages.jsonl next to the CSVs) ----
+
+    def _flush_outages(self, st: State) -> None:
+        """Persist closed outage windows from st.closed_outages."""
+        if not st.closed_outages:
+            return
+        try:
+            with st.lock:
+                items = list(st.closed_outages)
+                st.closed_outages.clear()
+            with open(os.path.join(self._logs_dir(), "outages.jsonl"),
+                      "a", encoding="utf-8") as f:
+                for kind, t0, t1 in items:
+                    f.write(json.dumps({
+                        "kind": kind,
+                        "start": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t0)),
+                        "start_epoch": round(t0, 3),
+                        "end": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t1)),
+                        "end_epoch": round(t1, 3),
+                        "seconds": round(t1 - t0, 1),
+                    }) + "\n")
+        except Exception:
+            pass  # never let logging take down collection
+
+    def finalize_outages(self):
+        """Close still-open outage spans (app exiting mid-outage) and persist."""
+        st = self.state
+        now = time.time()
+        with st.lock:
+            for kind in ("wan", "lan"):
+                since = st.wan_down_since if kind == "wan" else st.lan_down_since
+                if since is None:
+                    continue
+                spans = st.wan_outage_spans if kind == "wan" else st.lan_outage_spans
+                if spans and spans[-1][1] is None:
+                    spans[-1][1] = now
+                if kind == "wan":
+                    st.wan_down_since = None
+                else:
+                    st.lan_down_since = None
+                st.closed_outages.append((kind, since, now))
+        self._flush_outages(st)
+
     # ---- CSV logging (single-writer: only the collector thread touches the file) ----
 
     @staticmethod
@@ -965,7 +1143,7 @@ class Collector(threading.Thread):
     # One row per probe; the trailing 'score' column is the connection score.
     LOG_HEADER = ["time_iso", "epoch", "gateway", "lan_ms", "wan_ms", "dns_ms",
                   "dns_server", "signal_pct", "extra_ms", "extra_target", "load",
-                  "score"]
+                  "score", "down_mbps", "up_mbps"]
 
     def start_logging(self, logs_dir: str | None = None) -> str | None:
         """Open today's CSV file (one per day) and begin writing one row per probe."""
@@ -1037,6 +1215,7 @@ class Collector(threading.Thread):
                 self._fmt(extra_rtt), st.extra_host or "",
                 "1" if load_active else "",
                 f"{score:.1f}" if score is not None else "",
+                self._fmt(self._last_rate[0]), self._fmt(self._last_rate[1]),
             ])
             self.log_file.flush()
         except Exception:
@@ -1094,6 +1273,8 @@ class GraphWidget(tk.Canvas):
         self.fonts = fonts or {}
         self.empty_text = empty_text
         self.data: list[Sample] = []
+        self.overlay: list[Sample] | None = None  # 2nd series (e.g. upload)
+        self.overlay_color = BLUE
         self._hover: list[int] = []
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<Motion>", self._on_motion)
@@ -1103,6 +1284,12 @@ class GraphWidget(tk.Canvas):
         self.data = data[-self.max_points:]
         self.spans = spans or []
         self.redraw()
+
+    def set_overlay(self, data: list[Sample], color: str = BLUE):
+        """Set a second series (index-aligned with the main data); no redraw
+        here — set_data() (called right after) redraws."""
+        self.overlay = data[-self.max_points:]
+        self.overlay_color = color
 
     # ---- drawing ----
 
@@ -1123,10 +1310,13 @@ class GraphWidget(tk.Canvas):
                          fill=MUTED, font=f.get("small"))
 
         vals = [s.v for s in self.data if s.v is not None]
+        range_vals = list(vals)
+        if self.overlay:
+            range_vals += [s.v for s in self.overlay if s.v is not None]
         if self.fixed_range:
             lo, hi = self.fixed_range
-        elif vals:
-            lo, hi = min(vals), max(vals)
+        elif range_vals:
+            lo, hi = min(range_vals), max(range_vals)
             if hi - lo < 1e-9:
                 lo, hi = lo - 1, hi + 1
             pad = (hi - lo) * 0.15
@@ -1166,16 +1356,18 @@ class GraphWidget(tk.Canvas):
 
         fill_color = blend(self.color, BG, 0.82)
 
-        # load-test windows: shaded bands so latency-under-load is visible
-        for t0, t1, label in getattr(self, "spans", []):
+        # shaded bands: load-test windows (blue) and outages (red, 4-element spans)
+        for span in getattr(self, "spans", []):
+            t0, t1, label = span[0], span[1], span[2]
+            span_color = span[3] if len(span) > 3 else BLUE
             idx = [i for i, s in enumerate(self.data)
                    if s.t >= t0 and (t1 is None or s.t <= t1)]
             if len(idx) >= 2:
                 x0, x1 = px(idx[0]), px(idx[-1])
                 self.create_rectangle(x0, pad_t, x1, self._plot[3],
-                                      fill=blend(BLUE, BG, 0.86), outline="")
+                                      fill=blend(span_color, BG, 0.86), outline="")
                 self.create_text(x0 + 4, pad_t + 8, anchor="w", text=label or "LOAD",
-                                 fill=blend(BLUE, TEXT, 0.55), font=f.get("tiny"))
+                                 fill=blend(span_color, TEXT, 0.55), font=f.get("tiny"))
 
         # contiguous segments (gaps where v is None)
         seg, segments = [], []
@@ -1201,6 +1393,27 @@ class GraphWidget(tk.Canvas):
                 self.create_oval(x - 2, y - 2, x + 2, y + 2,
                                  fill=self.color, outline="")
 
+        # overlay series (e.g. upload on the throughput graph) — plain line
+        if self.overlay:
+            oseg, osegments = [], []
+            for i, s in enumerate(self.overlay):
+                if s.v is None:
+                    if oseg:
+                        osegments.append(oseg)
+                        oseg = []
+                else:
+                    oseg.append((px(i), py(s.v)))
+            if oseg:
+                osegments.append(oseg)
+            for pts in osegments:
+                if len(pts) >= 2:
+                    self.create_line(*[c for p in pts for c in p], fill=self.overlay_color,
+                                     width=2, joinstyle="round")
+                else:  # single isolated sample — draw a dot
+                    x, y = pts[0]
+                    self.create_oval(x - 2, y - 2, x + 2, y + 2,
+                                     fill=self.overlay_color, outline="")
+
         # loss markers (red ticks along the bottom)
         for i, s in enumerate(self.data):
             if s.v is None:
@@ -1220,11 +1433,20 @@ class GraphWidget(tk.Canvas):
                              text=f"avg {avg:.1f}", fill=blend(self.color, TEXT, 0.6),
                              font=f.get("tiny"))
 
-        # current value, top-right
+        # current value, top-right (overlay value sits to its left)
         last = next((s.v for s in reversed(self.data) if s.v is not None), None)
         if last is not None:
-            self.create_text(self._plot[2], 14, anchor="e",
-                             text=f"{last:.1f} {self.unit}", fill=self.color, font=f.get("value"))
+            text = f"{last:.1f} {self.unit}"
+            x = self._plot[2]
+            if self.overlay:
+                olast = next((s.v for s in reversed(self.overlay) if s.v is not None), None)
+                if olast is not None:
+                    otext = f"{olast:.1f} {self.unit}"
+                    m = self.fonts.get("value")
+                    off = m.measure(text) + 14 if m else 90
+                    self.create_text(x - off, 14, anchor="e", text=otext,
+                                     fill=self.overlay_color, font=f.get("value"))
+            self.create_text(x, 14, anchor="e", text=text, fill=self.color, font=f.get("value"))
 
     # ---- hover ----
 
@@ -1396,6 +1618,7 @@ class Dashboard(tk.Tk):
             body.grid_columnconfigure(c, weight=1, uniform="g")
         body.grid_rowconfigure(0, weight=3, uniform="gh")
         body.grid_rowconfigure(1, weight=2, uniform="gh")
+        body.grid_rowconfigure(2, weight=2, uniform="gh")
 
         self.g_wan = GraphWidget(body, "Internet latency (WAN)", "ms", GREEN,
                                  fonts=self.fonts, bg=CARD)
@@ -1416,6 +1639,10 @@ class Dashboard(tk.Tk):
         self.g_signal.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
         self.g_dns.grid(row=1, column=2, sticky="nsew", padx=4, pady=4)
 
+        self.g_rate = GraphWidget(body, "Throughput (green down · blue up)", "Mbps", GREEN,
+                                  fonts=self.fonts, bg=CARD)
+        self.g_rate.grid(row=2, column=0, columnspan=3, sticky="nsew", padx=4, pady=4)
+
     def _build_log(self):
         bar = tk.Frame(self, bg=PANEL)
         bar.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
@@ -1429,6 +1656,9 @@ class Dashboard(tk.Tk):
                   fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
                   relief="flat", font=self.fonts["small"], padx=12).pack(side="right")
         tk.Button(bar, text="MTU probe", command=self._run_mtu_probe, bg=CARD,
+                  fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
+                  relief="flat", font=self.fonts["small"], padx=12).pack(side="right")
+        tk.Button(bar, text="Outages", command=self._open_outage_dialog, bg=CARD,
                   fg=TEXT, activebackground=BORDER, activeforeground=TEXT,
                   relief="flat", font=self.fonts["small"], padx=12).pack(side="right")
         tk.Button(bar, text="Reset stats", command=self._reset_stats, bg=CARD, fg=TEXT,
@@ -1521,6 +1751,93 @@ class Dashboard(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     # ---- load test ----
+
+    def _open_outage_dialog(self):
+        f = self.fonts
+        dlg = tk.Toplevel(self)
+        dlg.title("Outage history & uptime")
+        dlg.configure(bg=PANEL, padx=14, pady=10)
+        dlg.transient(self)
+
+        def dur(sec):
+            sec = int(round(sec))
+            h, rem = divmod(sec, 3600)
+            m, s = divmod(rem, 60)
+            if h:
+                return f"{h}h {m}m"
+            if m:
+                return f"{m}m {s}s"
+            return f"{s}s"
+
+        rows = []
+        try:
+            path = os.path.join(self.collector._logs_dir(), "outages.jsonl")
+            with open(path, encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if ln:
+                        try:
+                            rows.append(json.loads(ln))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        now = time.time()
+
+        def uptime(window_s, kind):
+            """(uptime %, outage count, longest outage) over the last window_s."""
+            lo = now - window_s
+            down, n, longest = 0.0, 0, 0.0
+            for r in rows:
+                if r.get("kind") != kind:
+                    continue
+                a = max(r.get("start_epoch", 0), lo)
+                b = min(r.get("end_epoch", 0), now)
+                if b <= a:
+                    continue
+                n += 1
+                down += b - a
+                longest = max(longest, b - a)
+            return max(0.0, 100.0 * (1.0 - down / window_s)), n, longest
+
+        txt = tk.Text(dlg, bg=CARD, fg=TEXT, relief="flat", font=f["sub"],
+                      width=78, height=20, padx=10, pady=8)
+        txt.pack(fill="both", expand=True)
+        for tag, color in (("good", GREEN), ("bad", RED), ("muted", MUTED),
+                           ("head", CYAN), ("warn", YELLOW)):
+            txt.tag_configure(tag, foreground=color)
+
+        txt.insert("end", "UPTIME\n", "head")
+        for kind, label in (("wan", "Internet"), ("lan", "Router")):
+            for w, wl in ((86400, "24h"), (7 * 86400, "7d")):
+                pct, n, longest = uptime(w, kind)
+                tag = "good" if pct >= 99.5 else ("warn" if pct >= 97 else "bad")
+                out = f"{n} outage{'s' if n != 1 else ''}"
+                if n:
+                    out += f", longest {dur(longest)}"
+                txt.insert("end", f"{label:8}")
+                txt.insert("end", f"{wl} {pct:.2f}%", tag)
+                txt.insert("end", f"  ({out})" + ("   " if wl == "24h" else "") + "\n")
+        with self.state.lock:
+            c = dict(self.state.counts)
+        sent, recv = c["wan_sent"], c["wan_recv"]
+        pct = 100.0 * recv / sent if sent else 100.0
+        txt.insert("end", f"Session  ")
+        txt.insert("end", f"{pct:.1f}% up", "good" if pct >= 99.0 else "warn")
+        txt.insert("end", f"  ({recv:,} of {sent:,} WAN probes answered)\n")
+
+        txt.insert("end", "\nRECENT OUTAGES\n", "head")
+        recent = [r for r in rows if r.get("end_epoch", 0) >= now - 30 * 86400]
+        recent.sort(key=lambda r: r.get("start_epoch", 0), reverse=True)
+        if not recent:
+            txt.insert("end", "no outages recorded — all clear\n", "muted")
+        else:
+            for r in recent[:20]:
+                txt.insert("end", f"{r.get('start', '?')}  →  {r.get('end', '?')}"
+                           f"   {dur(r.get('seconds', 0)):>8}   "
+                           f"{'internet' if r.get('kind') == 'wan' else 'router'}\n",
+                           "bad" if r.get("kind") == "wan" else "warn")
+        txt.config(state="disabled")
 
     def _open_load_dialog(self):
         f = self.fonts
@@ -1684,6 +2001,9 @@ class Dashboard(tk.Tk):
             lan, wan, dns, sig, extra = (list(st.lan), list(st.wan), list(st.dns),
                                          list(st.signal), list(st.extra))
             spans = list(st.load_spans)
+            wan_out = [[t0, t1, "OUTAGE", RED] for t0, t1 in st.wan_outage_spans]
+            lan_out = [[t0, t1, "OUTAGE", RED] for t0, t1 in st.lan_outage_spans]
+            rate_down, rate_up = list(st.rate_down), list(st.rate_up)
             counts = dict(st.counts)
             wifi, wifi_avail = st.wifi, st.wifi_available
             events = list(st.events)
@@ -1787,10 +2107,10 @@ class Dashboard(tk.Tk):
 
         # --- graphs ---
         window = st.window
-        self.g_wan.set_data(wan[-window:], spans)
-        self.g_lan.set_data(lan[-window:], spans)
-        self.g_dns.set_data(dns[-window:], spans)
-        self.g_extra.set_data(extra[-window:], spans)
+        self.g_wan.set_data(wan[-window:], spans + wan_out)
+        self.g_lan.set_data(lan[-window:], spans + lan_out)
+        self.g_dns.set_data(dns[-window:], spans + wan_out)
+        self.g_extra.set_data(extra[-window:], spans + wan_out)
         # jitter series: |Δ| between consecutive present samples
         js = []
         prev_t = prev_v = None
@@ -1806,6 +2126,8 @@ class Dashboard(tk.Tk):
                 prev_t, prev_v = s.t, s.v
         self.g_jitter.set_data(js[-window:], spans)
         self.g_signal.set_data(sig[-window:])
+        self.g_rate.set_overlay(rate_up[-window:], BLUE)
+        self.g_rate.set_data(rate_down[-window:])
 
         # --- event log ---
         if len(events) != getattr(self, "_log_len", -1):
@@ -1821,6 +2143,7 @@ class Dashboard(tk.Tk):
     def _on_close(self):
         self.collector.stop_flag.set()
         self.collector.stop_logging()
+        self.collector.finalize_outages()
         self.destroy()
 
 

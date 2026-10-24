@@ -36,6 +36,14 @@ The point of the LAN/WAN split is telling you *where* a problem is:
   bottom bar, or `--mtu [host]` on the CLI.
 - **DNS latency** — a real A-record query over raw UDP to your system DNS
   (or a server of your choice — set it in the top bar or with `--dns-server`)
+- **Throughput** — live download/upload Mbps from the interface byte
+  counters (no probes, no load test — the OS reports what the adapter
+  actually sent and received). Full-width graph at the bottom; green =
+  down, blue = up. Also written to the CSV logs.
+- **Outage shading & history** — outage periods are shaded red on the
+  latency graphs and persisted to `logs/outages.jsonl`. The **Outages**
+  button shows internet/router uptime over the last 24h and 7d, the
+  longest outage, and a list of recent outages (works across restarts).
 - **Load testing** — fill any path on demand: a built-in mini-iperf
   (`--serve` peer + TCP streams) and a rate-capped rude UDP mode for
   peer-less tests. Latency-under-load (bufferbloat) is measured and shaded
@@ -74,8 +82,8 @@ to across restarts, rolled over at midnight), or `~/NetworkMonitorLogs` if
 that directory can't be created:
 
 ```csv
-time_iso,epoch,gateway,lan_ms,wan_ms,dns_ms,dns_server,signal_pct,extra_ms,extra_target,load,score
-2026-10-16 23:06:01,1792206361.986,10.0.0.1,,60.0,28.6,192.168.0.249,,12.4,,1,87.2
+time_iso,epoch,gateway,lan_ms,wan_ms,dns_ms,dns_server,signal_pct,extra_ms,extra_target,load,score,down_mbps,up_mbps
+2026-10-16 23:06:01,1792206361.986,10.0.0.1,,60.0,28.6,192.168.0.249,,12.4,,1,87.2,123.4,3.2
 ```
 
 Blank cells are real failures — DNS is probed every tick, so a blank there

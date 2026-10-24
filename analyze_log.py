@@ -56,6 +56,8 @@ def load(paths):
                             "extra": float(r["extra_ms"]) if r.get("extra_ms") else None,
                             "load": (r.get("load") or "").strip() == "1",
                             "score": float(r["score"]) if r.get("score") else None,
+                            "down": float(r["down_mbps"]) if r.get("down_mbps") else None,
+                            "up": float(r["up_mbps"]) if r.get("up_mbps") else None,
                         })
                     except (KeyError, ValueError):
                         continue  # tolerate truncated/partial lines
@@ -111,6 +113,13 @@ def report(rows):
     scores = [r["score"] for r in rows if r.get("score") is not None]
     if scores:
         print(f"Score   : avg {statistics.fmean(scores):.0f} / 100 over {len(scores)} scored samples")
+    downs = [r["down"] for r in rows if r.get("down") is not None]
+    ups = [r["up"] for r in rows if r.get("up") is not None]
+    if downs:
+        line = f"Through : avg down {statistics.fmean(downs):7.1f} Mbps"
+        if ups:
+            line += f", up {statistics.fmean(ups):7.1f} Mbps"
+        print(line)
     loaded = [r for r in rows if r.get("load")]
     idle = [r for r in rows if not r.get("load")]
     if loaded:
