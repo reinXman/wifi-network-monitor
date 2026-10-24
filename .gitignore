@@ -16,3 +16,6 @@ netlog_*.csv
 .DS_Store
 Thumbs.db
 AGENTS.md
+
+# Local dev log (agent/human session notes — stays out of the repo)
+DEVLOG.md
