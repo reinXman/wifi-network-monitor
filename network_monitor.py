@@ -330,24 +330,40 @@ _CHUNK = 256 * 1024
 
 
 class _Rate:
-    """Shared token-bucket rate limiter (bytes across all streams). 0 = flat out."""
+    """Shared token-bucket rate limiter (bytes across all streams). 0 = flat out.
+
+    Threads block on a condition until the bucket refills — sleeping per-thread
+    doesn't work, because N threads sleeping in parallel would multiply the
+    effective rate by N. Burst is capped at ~0.2s worth of bandwidth so a fresh
+    bucket can't blast its way out of the cap at startup.
+    """
+
+    BURST_S = 0.2
+    MAX_WAIT_S = 0.25
 
     def __init__(self, mbps: float):
         self.rate = mbps * 1e6 / 8.0 if mbps and mbps > 0 else 0.0
-        self.sent = 0
-        self.t0 = None
-        self.lock = threading.Lock()
+        self.credit = self.rate * self.BURST_S
+        self.t_last = None
+        self.cv = threading.Condition()
 
     def wait(self, n: int):
         if not self.rate:
             return
-        with self.lock:
-            if self.t0 is None:
-                self.t0 = time.perf_counter()
-            self.sent += n
-            over = self.sent - self.rate * (time.perf_counter() - self.t0)
-        if over > 0:
-            time.sleep(min(0.1, over / self.rate))
+        with self.cv:
+            while True:
+                now = time.perf_counter()
+                if self.t_last is None:
+                    self.t_last = now
+                # refill credit from elapsed time, capped at the burst allowance
+                self.credit = min(self.credit + self.rate * (now - self.t_last),
+                                  self.rate * self.BURST_S)
+                self.t_last = now
+                if self.credit >= n:
+                    self.credit -= n
+                    return
+                # not enough credit yet — sleep until it accrues (lock released)
+                self.cv.wait(min((n - self.credit) / self.rate, self.MAX_WAIT_S))
 
 
 def load_server(port: int = DEFAULT_LOAD_PORT) -> None:
@@ -416,10 +432,10 @@ def tcp_load_client(host: str, port: int = DEFAULT_LOAD_PORT, seconds: float = 1
     achieved Mbps per direction, e.g. {"down": 94.2, "up": 11.5} (None = failed).
     """
     results: dict = {}
+    rate = _Rate(mbps)  # one shared limiter — the cap is for the whole test, not per stream
+    payload = os.urandom(_CHUNK)
 
-    def stream(d: str):
-        rate = _Rate(mbps)
-        payload = os.urandom(_CHUNK)
+    def stream(d: str) -> int:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sent = 0
         try:
@@ -443,23 +459,29 @@ def tcp_load_client(host: str, port: int = DEFAULT_LOAD_PORT, seconds: float = 1
                     if not got:
                         break
                     sent += len(got)
-            results[d] = sent * 8.0 / 1e6 / seconds
+                    rate.wait(len(got))  # cap the download side too
         except OSError as e:
-            results[d] = None
             results["error"] = str(e)
+            return 0
         finally:
             try:
                 s.close()
             except OSError:
                 pass
+        return sent
 
     def wave(d: str):
-        threads = [threading.Thread(target=stream, args=(d,), daemon=True)
-                   for _ in range(max(1, streams))]
+        totals = [0] * max(1, streams)
+        threads = [threading.Thread(target=lambda i=i: totals.__setitem__(i, stream(d)),
+                                    daemon=True)
+                   for i in range(len(totals))]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        total = sum(totals)  # aggregate across streams
+        if total:
+            results[d] = total * 8.0 / 1e6 / seconds
 
     if direction in ("down", "both"):
         wave("down")
@@ -1665,8 +1687,11 @@ class Dashboard(tk.Tk):
                   activebackground=BORDER, activeforeground=TEXT, relief="flat",
                   font=self.fonts["small"], padx=12).pack(side="right")
         self._paused = False
-        self.log_btn = tk.Button(bar, text="Logging: OFF", command=self._toggle_logging,
-                                 bg=CARD, fg=MUTED, activebackground=BORDER,
+        logging_on = self.collector.log_flag.is_set()
+        self.log_btn = tk.Button(bar, text="Logging: ON" if logging_on else "Logging: OFF",
+                                 command=self._toggle_logging,
+                                 bg=CARD, fg=GREEN if logging_on else MUTED,
+                                 activebackground=BORDER,
                                  activeforeground=TEXT, relief="flat",
                                  font=self.fonts["small"], padx=12)
         self.log_btn.pack(side="right", padx=(0, 12))
@@ -2176,7 +2201,19 @@ def cli_mtu_probe(host: str, timeout_ms: int = 1000) -> None:
 
 def headless(state: State, collector: Collector, seconds: float = 5.0):
     collector.start()
-    time.sleep(seconds)
+    if seconds > 0:
+        time.sleep(seconds)
+    else:
+        print("Headless mode: probing until Ctrl+C …")
+        try:
+            while not collector.stop_flag.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            collector.stop_flag.set()
+            collector.stop_logging()
+            collector.finalize_outages()
     series = [("LAN", state.lan), ("WAN", state.wan), ("DNS", state.dns)]
     if state.extra_host:
         series.insert(2, ("CUSTOM", state.extra))
@@ -2205,6 +2242,9 @@ def main():
                     help="DNS probe server ('auto' = use system DNS)")
     ap.add_argument("--dns-name", default="www.google.com", help="DNS probe name")
     ap.add_argument("--no-gui", action="store_true", help="headless diagnostic mode")
+    ap.add_argument("--duration", type=float, default=5.0, metavar="SECONDS",
+                    help="with --no-gui: seconds to probe (0 = run until Ctrl+C; "
+                         "default 5)")
     ap.add_argument("--serve", action="store_true",
                     help="act as a load-test peer (mini-iperf server); Ctrl+C to stop")
     ap.add_argument("--port", type=int, default=DEFAULT_LOAD_PORT,
@@ -2227,6 +2267,11 @@ def main():
     ap.add_argument("--mtu", metavar="HOST", nargs="?", const="", default=None,
                     help="path-MTU / PMTUD probe to HOST (default: the gateway); "
                          "probes and exits")
+    ap.add_argument("--log", action="store_true",
+                    help="start CSV logging immediately (same as the Logging button)")
+    ap.add_argument("--log-dir", metavar="DIR", default=None,
+                    help="directory for CSV logs (default: 'logs' next to this "
+                         "script, falling back to ~/NetworkMonitorLogs)")
     args = ap.parse_args()
 
     if args.mtu is not None:
@@ -2246,8 +2291,13 @@ def main():
     collector = Collector(state, args.interval, args.wan, args.dns_server,
                           args.dns_name, args.extra)
 
+    if args.log:
+        path = collector.start_logging(args.log_dir)
+        if path:
+            print(f"Logging to {path}")
+
     if args.no_gui:
-        headless(state, collector)
+        headless(state, collector, seconds=args.duration)
         return
 
     collector.start()
