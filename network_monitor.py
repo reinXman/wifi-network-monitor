@@ -155,6 +155,21 @@ def icmp_ping(ip_str: str, timeout_ms: int = 1500,
     return rtt
 
 
+def icmp_ping_confirmed(ip_str: str, timeout_ms: int = 1500,
+                        payload: bytes = DEFAULT_PAYLOAD) -> float | None:
+    """Ping once; on failure immediately re-probe once before giving up.
+
+    A single dropped ICMP packet is ordinary background loss, not an
+    outage — without the retry, one lost probe gets logged as an
+    "Internet connectivity LOST" event plus a ~0.1s outage span.
+    Returns the final RTT, or None only if both probes failed.
+    """
+    rtt = icmp_ping(ip_str, timeout_ms, payload)
+    if rtt is None:
+        rtt = icmp_ping(ip_str, timeout_ms, payload)
+    return rtt
+
+
 def resolve_host(host: str) -> str | None:
     """Return an IPv4 address for a target (IP passthrough or DNS lookup)."""
     if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host or ""):
@@ -1010,9 +1025,10 @@ class Collector(threading.Thread):
             if self._wan_ip is None:
                 self._resolve_targets(st)
 
-            lan_rtt = icmp_ping(st.gateway) if st.gateway else None
-            wan_rtt = icmp_ping(self._wan_ip) if self._wan_ip else None
-            extra_rtt = icmp_ping(self._extra_ip) if self._extra_ip else None
+            # confirmed pings: one dropped packet must not read as "down"
+            lan_rtt = icmp_ping_confirmed(st.gateway) if st.gateway else None
+            wan_rtt = icmp_ping_confirmed(self._wan_ip) if self._wan_ip else None
+            extra_rtt = icmp_ping_confirmed(self._extra_ip) if self._extra_ip else None
             with st.lock:
                 st.counts["lan_sent"] += 1
                 st.counts["wan_sent"] += 1
@@ -1044,6 +1060,9 @@ class Collector(threading.Thread):
             server = st.dns_server if (self.dns_server == "auto" and st.dns_server) \
                 else (self.dns_server if self.dns_server != "auto" else "1.1.1.1")
             self._last_dns = dns_probe(server, self.dns_name)
+            if self._last_dns is None:
+                # one lost UDP packet ≠ DNS outage — retry once
+                self._last_dns = dns_probe(server, self.dns_name)
             st.record(st.dns, self._last_dns)
 
             if self._tick % 10 == 5:  # WiFi info refresh every 10th tick
