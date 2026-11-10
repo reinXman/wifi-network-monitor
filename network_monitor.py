@@ -865,7 +865,8 @@ class State:
 
     def check_transitions(self, lan_ok: bool, wan_ok: bool,
                           extra_ok: bool | None = None,
-                          extra_label: str | None = None):
+                          extra_label: str | None = None,
+                          extra_tcp_ok: bool | None = None):
         if self._lan_ok is not None:
             if self._lan_ok and not lan_ok:
                 self.add_event("Connection to router LOST", "bad")
@@ -878,7 +879,16 @@ class State:
                 self.add_event("Internet connectivity restored", "good")
         if extra_ok is not None and self._extra_ok is not None and extra_label:
             if self._extra_ok and not extra_ok:
-                self.add_event(f"Custom target {extra_label} LOST", "bad")
+                if extra_tcp_ok:
+                    self.add_event(f"Custom target {extra_label} LOST — but the TCP "
+                                   "probe is still reachable; ICMP is likely "
+                                   "blocked/rate-limited and the target is up",
+                                   "warn")
+                elif extra_tcp_ok is not None:
+                    self.add_event(f"Custom target {extra_label} LOST "
+                                   "(ICMP and TCP probe both failed)", "bad")
+                else:
+                    self.add_event(f"Custom target {extra_label} LOST", "bad")
             elif not self._extra_ok and extra_ok:
                 self.add_event(f"Custom target {extra_label} restored", "good")
         self._lan_ok, self._wan_ok = lan_ok, wan_ok
@@ -912,12 +922,14 @@ class State:
 
 class Collector(threading.Thread):
     def __init__(self, state: State, interval: float, wan_host: str, dns_server: str,
-                 dns_name: str, extra_host: str | None = None):
+                 dns_name: str, extra_host: str | None = None,
+                 extra_tcp_port: int = 443):
         super().__init__(daemon=True)
         self.state = state
         self.interval = interval
         self.wan_host = wan_host
         self.extra_host = extra_host
+        self.extra_tcp_port = extra_tcp_port
         self.dns_server = dns_server
         self.dns_name = dns_name
         self.stop_flag = threading.Event()
@@ -926,6 +938,7 @@ class Collector(threading.Thread):
         self._wan_ip = None    # resolved IPv4 for the WAN target
         self._extra_ip = None  # resolved IPv4 for the custom target
         self._last_tcp_check = 0.0
+        self._last_extra_tcp = None  # TCP cross-check RTT for the custom target
         self._tp = None  # (t, if_index, in_octets, out_octets) baseline for rates
         self._last_rate = (None, None)  # (down_mbps, up_mbps) for the CSV row
         self._iface_noted = False
@@ -969,7 +982,19 @@ class Collector(threading.Thread):
         msg = f"Targets set — WAN {wan_host} ({self._wan_ip or 'unresolved'})"
         if extra_host:
             msg += f"; custom {extra_host} ({self._extra_ip or 'unresolved'})"
+            if self.extra_tcp_port:
+                msg += f"; TCP cross-check :{self.extra_tcp_port}"
         st.add_event(msg, "info")
+        return True
+
+    def set_extra_tcp_port(self, port: int) -> bool:
+        """Live-update the custom target's TCP cross-check port (0 disables)."""
+        if not (isinstance(port, int) and 0 <= port <= 65535):
+            return False
+        self.extra_tcp_port = port
+        self.state.add_event("Custom-target TCP cross-check "
+                             + (f"set to port {port}" if port else "disabled"),
+                             "info")
         return True
 
     def set_dns(self, server: str) -> bool:
@@ -1029,6 +1054,15 @@ class Collector(threading.Thread):
             lan_rtt = icmp_ping_confirmed(st.gateway) if st.gateway else None
             wan_rtt = icmp_ping_confirmed(self._wan_ip) if self._wan_ip else None
             extra_rtt = icmp_ping_confirmed(self._extra_ip) if self._extra_ip else None
+            # cross-check for the custom target: when ICMP fails, try a TCP
+            # connect so ICMP rate-limiting doesn't read as "target down".
+            # Only probed on ICMP failure — a healthy ICMP answer already
+            # proves the host is up. Result goes to the extra_tcp_ms column.
+            extra_tcp_rtt = None
+            if self.extra_host and self._extra_ip and self.extra_tcp_port:
+                if extra_rtt is None:
+                    extra_tcp_rtt = tcp_probe(self._extra_ip, self.extra_tcp_port)
+                self._last_extra_tcp = extra_tcp_rtt
             with st.lock:
                 st.counts["lan_sent"] += 1
                 st.counts["wan_sent"] += 1
@@ -1043,7 +1077,9 @@ class Collector(threading.Thread):
                 st.record(st.extra, extra_rtt)
             st.check_transitions(lan_rtt is not None, wan_rtt is not None,
                                  extra_rtt is not None if self.extra_host else None,
-                                 self.extra_host)
+                                 self.extra_host,
+                                 extra_tcp_ok=(extra_tcp_rtt is not None)
+                                 if self.extra_host and self.extra_tcp_port else None)
             self._sample_throughput(st)
             self._flush_outages(st)
 
@@ -1184,7 +1220,7 @@ class Collector(threading.Thread):
     # One row per probe; the trailing 'score' column is the connection score.
     LOG_HEADER = ["time_iso", "epoch", "gateway", "lan_ms", "wan_ms", "dns_ms",
                   "dns_server", "signal_pct", "extra_ms", "extra_target", "load",
-                  "score", "down_mbps", "up_mbps"]
+                  "score", "down_mbps", "up_mbps", "extra_tcp_ms"]
 
     def start_logging(self, logs_dir: str | None = None) -> str | None:
         """Open today's CSV file (one per day) and begin writing one row per probe."""
@@ -1209,6 +1245,8 @@ class Collector(threading.Thread):
                 break
             n += 1
         new = not os.path.exists(path) or os.path.getsize(path) == 0
+        if not new:
+            self._upgrade_header(path)  # must run before the append handle opens
         f = open(path, "a", newline="", encoding="utf-8")
         if new:
             csv.writer(f).writerow(self.LOG_HEADER)
@@ -1217,6 +1255,31 @@ class Collector(threading.Thread):
         self.log_path = path
         self._log_date = date
         return path
+
+    def _upgrade_header(self, path: str) -> None:
+        """If the file predates a schema change, rewrite its header line.
+
+        The new column is appended at the end, so old data rows (fewer
+        fields) still parse correctly — readers just see the new column
+        as empty for them. Runs once per open; cheap no-op when current.
+        """
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as fh:
+                first = fh.readline()
+            have = next(csv.reader([first]), None)
+            if have == self.LOG_HEADER or not have:
+                return
+            tmp = path + ".tmp"
+            with open(path, "r", newline="", encoding="utf-8") as fh, \
+                    open(tmp, "w", newline="", encoding="utf-8") as out:
+                csv.writer(out).writerow(self.LOG_HEADER)
+                out.writelines(fh.readlines()[1:])
+            os.replace(tmp, path)
+            self.state.add_event(f"Upgraded log header in "
+                                 f"{os.path.basename(path)}: added "
+                                 f"{[c for c in self.LOG_HEADER if c not in have]}")
+        except Exception as e:
+            self.state.add_event(f"Could not upgrade log header: {e}", "warn")
 
     def stop_logging(self):
         self.log_flag.clear()
@@ -1257,6 +1320,7 @@ class Collector(threading.Thread):
                 "1" if load_active else "",
                 f"{score:.1f}" if score is not None else "",
                 self._fmt(self._last_rate[0]), self._fmt(self._last_rate[1]),
+                self._fmt(self._last_extra_tcp),
             ])
             self.log_file.flush()
         except Exception:
@@ -1595,27 +1659,47 @@ class Dashboard(tk.Tk):
         bar = tk.Frame(self, bg=PANEL, pady=6, padx=14)
         bar.grid(row=2, column=0, sticky="ew")
 
-        def mk(label, initial, on_apply):
+        def mk(label, initial, on_apply, width=20):
             tk.Label(bar, text=label, bg=PANEL, fg=MUTED,
                      font=self.fonts["small"]).pack(side="left", padx=(0, 6))
             var = tk.StringVar(value=initial or "")
             ent = tk.Entry(bar, textvariable=var, bg=CARD, fg=TEXT,
                            insertbackground=TEXT, relief="flat",
-                           font=self.fonts["sub"], width=20)
+                           font=self.fonts["sub"], width=width)
             ent.pack(side="left", padx=(0, 18))
             ent.bind("<Return>", lambda e: on_apply())
             return var
 
         self.wan_var = mk("WAN TARGET", self.collector.wan_host, self._apply_targets)
         self.extra_var = mk("CUSTOM TARGET", self.collector.extra_host, self._apply_targets)
+        self.extra_tcp_var = mk("TCP CHECK",
+                                str(self.collector.extra_tcp_port)
+                                if self.collector.extra_tcp_port else "",
+                                self._apply_extra_tcp, width=6)
         self.dns_var = mk("DNS TARGET", self.collector.dns_server, self._apply_dns)
-        tk.Label(bar, text="IP or hostname · press Enter to apply",
+        tk.Label(bar, text="IP or hostname · port 0 = TCP check off · press Enter to apply",
                  bg=PANEL, fg=MUTED, font=self.fonts["tiny"]).pack(side="left")
 
     def _apply_targets(self):
         if not self.collector.set_targets(self.wan_var.get(),
                                           self.extra_var.get().strip() or None):
             self.state.add_event("WAN target cannot be empty", "warn")
+
+    def _apply_extra_tcp(self):
+        raw = (self.extra_tcp_var.get() or "").strip()
+        if raw == "":
+            port = 0
+        else:
+            try:
+                port = int(raw)
+            except ValueError:
+                self.state.add_event("TCP check port must be a number (0 = off)",
+                                     "warn")
+                return
+        if not self.collector.set_extra_tcp_port(port):
+            self.state.add_event("TCP check port must be 0–65535", "warn")
+            return
+        self.extra_tcp_var.set(str(port) if port else "")
 
     def _apply_dns(self):
         self.collector.set_dns(self.dns_var.get())
@@ -2257,6 +2341,12 @@ def main():
     ap.add_argument("--extra", default=None,
                     help="optional custom probe target (IP or hostname, "
                          "e.g. an internal routed hop)")
+    ap.add_argument("--extra-tcp-port", type=int, default=443,
+                    help="TCP port for the custom-target cross-check probe "
+                         "(0 = disable; default 443). When ICMP to the custom "
+                         "target fails, a TCP connect distinguishes 'host "
+                         "down' from 'ICMP blocked/rate-limited'; the result "
+                         "is logged to the extra_tcp_ms CSV column")
     ap.add_argument("--dns-server", default="auto",
                     help="DNS probe server ('auto' = use system DNS)")
     ap.add_argument("--dns-name", default="www.google.com", help="DNS probe name")
@@ -2293,6 +2383,9 @@ def main():
                          "script, falling back to ~/NetworkMonitorLogs)")
     args = ap.parse_args()
 
+    if not (0 <= args.extra_tcp_port <= 65535):
+        ap.error("--extra-tcp-port must be 0–65535")
+
     if args.mtu is not None:
         cli_mtu_probe(args.mtu or get_default_gateway() or args.wan)
         return
@@ -2308,7 +2401,7 @@ def main():
 
     state = State(args.window)
     collector = Collector(state, args.interval, args.wan, args.dns_server,
-                          args.dns_name, args.extra)
+                          args.dns_name, args.extra, args.extra_tcp_port)
 
     if args.log:
         path = collector.start_logging(args.log_dir)

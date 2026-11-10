@@ -22,7 +22,9 @@ The point of the LAN/WAN split is telling you *where* a problem is:
 - **Custom target** — a third probe to anything you want: another router, a
   VPN endpoint, an internal hop. Set it in the top bar (Enter to apply) or
   with `--extra`. Hostnames are fine and get re-resolved periodically, so
-  DDNS/DHCP changes are picked up.
+  DDNS/DHCP changes are picked up. When ICMP to it fails, a TCP cross-check
+  probe (port settable in the top bar next to the custom target, or with
+  `--extra-tcp-port`) tells "host down" from "ICMP blocked".
 - **Jitter** — mean |Δ| between consecutive WAN samples
 - **Packet loss** — failed WAN probes, per session
 - **Percentiles** — p50 / p95 / p99 for LAN and WAN latency (under the
@@ -69,6 +71,7 @@ Flags:
 --window 600          history length in samples (default 300)
 --wan 9.9.9.9         WAN probe host (IP or hostname)
 --extra 10.0.0.2      custom probe target (IP or hostname)
+--extra-tcp-port 443  TCP cross-check port for the custom target (0 = off)
 --dns-server auto     DNS probe server ('auto' = system DNS, the default)
 --mtu [host]          path-MTU / PMTUD probe (default: the gateway), then exit
 --no-gui              headless mode, prints 5 s of stats and exits
@@ -82,9 +85,16 @@ to across restarts, rolled over at midnight), or `~/NetworkMonitorLogs` if
 that directory can't be created:
 
 ```csv
-time_iso,epoch,gateway,lan_ms,wan_ms,dns_ms,dns_server,signal_pct,extra_ms,extra_target,load,score,down_mbps,up_mbps
-2026-10-16 23:06:01,1792206361.986,10.0.0.1,,60.0,28.6,192.168.0.249,,12.4,,1,87.2,123.4,3.2
+time_iso,epoch,gateway,lan_ms,wan_ms,dns_ms,dns_server,signal_pct,extra_ms,extra_target,load,score,down_mbps,up_mbps,extra_tcp_ms
+2026-10-16 23:06:01,1792206361.986,10.0.0.1,,60.0,28.6,192.168.0.249,,12.4,,1,87.2,123.4,3.2,
 ```
+
+`extra_tcp_ms` is the custom target's TCP cross-check: when ICMP to the
+custom target fails, the monitor tries a TCP connect (port 443 by default,
+`--extra-tcp-port 0` to disable) so ICMP rate-limiting doesn't read as
+"target down". Blank while ICMP is healthy; a value here with a blank
+`extra_ms` means the host is up but dropping pings; both blank means the
+host is genuinely unreachable.
 
 Blank cells are real failures — DNS is probed every tick, so a blank there
 means the query genuinely failed. WiFi signal is sampled every 10th tick and
